@@ -46,7 +46,9 @@ use crate::{
         RequestFrontMonthContract, ResponseCode, ResponseFrontMonthContract, ResponseSystemInfo,
         SYSTEM_INFO_REQUEST_TEMPLATE_ID, SYSTEM_INFO_RESPONSE_TEMPLATE_ID, SubscriptionRequest,
         FRONT_MONTH_REQUEST_TEMPLATE_ID, FRONT_MONTH_RESPONSE_TEMPLATE_ID, decode_inbound,
-        encode_frame,
+        encode_frame, DepthByOrder, DepthUpdateType, RequestDepthByOrderSnapshot,
+        RequestDepthByOrderUpdates, ResponseDepthByOrderSnapshot,
+        DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID, DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID,
     },
 };
 
@@ -59,6 +61,47 @@ pub(crate) struct RawOrderBookMetrics {
     max_ask_entries: AtomicU64,
     messages_with_order_counts: AtomicU64,
     messages_with_implicit_liquidity: AtomicU64,
+    mbp_parse_errors: AtomicU64,
+    mbp_array_mismatch_errors: AtomicU64,
+    mbp_timestamp_errors: AtomicU64,
+    mbo_snapshot_messages: AtomicU64,
+    mbo_update_messages: AtomicU64,
+    mbo_end_events: AtomicU64,
+    mbo_subscription_accepted: AtomicU64,
+    mbo_subscription_rejected: AtomicU64,
+    mbo_new_orders: AtomicU64,
+    mbo_changed_orders: AtomicU64,
+    mbo_deleted_orders: AtomicU64,
+    mbo_deletes_with_order_ids: AtomicU64,
+    mbo_entries_with_order_ids: AtomicU64,
+    mbo_entries_with_priority: AtomicU64,
+    mbo_entries_with_previous_price: AtomicU64,
+    mbo_selected_price_bits: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RawOrderBookMetricsSnapshot {
+    pub(crate) messages: u64,
+    pub(crate) max_bid_entries: u64,
+    pub(crate) max_ask_entries: u64,
+    pub(crate) messages_with_order_counts: u64,
+    pub(crate) messages_with_implicit_liquidity: u64,
+    pub(crate) mbp_parse_errors: u64,
+    pub(crate) mbp_array_mismatch_errors: u64,
+    pub(crate) mbp_timestamp_errors: u64,
+    pub(crate) mbo_snapshot_messages: u64,
+    pub(crate) mbo_update_messages: u64,
+    pub(crate) mbo_end_events: u64,
+    pub(crate) mbo_subscription_accepted: bool,
+    pub(crate) mbo_subscription_rejected: bool,
+    pub(crate) mbo_new_orders: u64,
+    pub(crate) mbo_changed_orders: u64,
+    pub(crate) mbo_deleted_orders: u64,
+    pub(crate) mbo_deletes_with_order_ids: u64,
+    pub(crate) mbo_entries_with_order_ids: u64,
+    pub(crate) mbo_entries_with_priority: u64,
+    pub(crate) mbo_entries_with_previous_price: u64,
+    pub(crate) mbo_selected_price: Option<f64>,
 }
 
 impl RawOrderBookMetrics {
@@ -82,15 +125,127 @@ impl RawOrderBookMetrics {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
-        (
-            self.messages.load(Ordering::Relaxed),
-            self.max_bid_entries.load(Ordering::Relaxed),
-            self.max_ask_entries.load(Ordering::Relaxed),
-            self.messages_with_order_counts.load(Ordering::Relaxed),
-            self.messages_with_implicit_liquidity
+    fn observe_mbo_snapshot(&self, response: &ResponseDepthByOrderSnapshot) {
+        self.mbo_snapshot_messages.fetch_add(1, Ordering::Relaxed);
+        self.mbo_entries_with_order_ids.fetch_add(
+            response
+                .exchange_order_id
+                .iter()
+                .filter(|value| !value.is_empty())
+                .count() as u64,
+            Ordering::Relaxed,
+        );
+        self.mbo_entries_with_priority.fetch_add(
+            response
+                .depth_order_priority
+                .iter()
+                .filter(|value| **value > 0)
+                .count() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn observe_mbp_parse_error(&self, error: &anyhow::Error) {
+        self.mbp_parse_errors.fetch_add(1, Ordering::Relaxed);
+        let message = error.to_string();
+        if message.contains("array lengths differ") {
+            self.mbp_array_mismatch_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if message.contains("timestamp is invalid") {
+            self.mbp_timestamp_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn observe_mbo_update(&self, update: &DepthByOrder) {
+        self.mbo_update_messages.fetch_add(1, Ordering::Relaxed);
+        for update_type in &update.update_type {
+            match DepthUpdateType::try_from(*update_type).unwrap_or_default() {
+                DepthUpdateType::New => self.mbo_new_orders.fetch_add(1, Ordering::Relaxed),
+                DepthUpdateType::Change => {
+                    self.mbo_changed_orders.fetch_add(1, Ordering::Relaxed)
+                }
+                DepthUpdateType::Delete => {
+                    self.mbo_deleted_orders.fetch_add(1, Ordering::Relaxed)
+                }
+                DepthUpdateType::Unspecified => 0,
+            };
+        }
+        self.mbo_deletes_with_order_ids.fetch_add(
+            update
+                .update_type
+                .iter()
+                .zip(&update.exchange_order_id)
+                .filter(|(update_type, order_id)| {
+                    matches!(
+                        DepthUpdateType::try_from(**update_type),
+                        Ok(DepthUpdateType::Delete)
+                    )
+                        && !order_id.is_empty()
+                })
+                .count() as u64,
+            Ordering::Relaxed,
+        );
+        self.mbo_entries_with_order_ids.fetch_add(
+            update
+                .exchange_order_id
+                .iter()
+                .filter(|value| !value.is_empty())
+                .count() as u64,
+            Ordering::Relaxed,
+        );
+        self.mbo_entries_with_priority.fetch_add(
+            update
+                .depth_order_priority
+                .iter()
+                .filter(|value| **value > 0)
+                .count() as u64,
+            Ordering::Relaxed,
+        );
+        self.mbo_entries_with_previous_price.fetch_add(
+            update
+                .prev_depth_price_flag
+                .iter()
+                .filter(|value| **value)
+                .count() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn snapshot(&self) -> RawOrderBookMetricsSnapshot {
+        let selected_price_bits = self.mbo_selected_price_bits.load(Ordering::Relaxed);
+        RawOrderBookMetricsSnapshot {
+            messages: self.messages.load(Ordering::Relaxed),
+            max_bid_entries: self.max_bid_entries.load(Ordering::Relaxed),
+            max_ask_entries: self.max_ask_entries.load(Ordering::Relaxed),
+            messages_with_order_counts: self.messages_with_order_counts.load(Ordering::Relaxed),
+            messages_with_implicit_liquidity: self
+                .messages_with_implicit_liquidity
                 .load(Ordering::Relaxed),
-        )
+            mbp_parse_errors: self.mbp_parse_errors.load(Ordering::Relaxed),
+            mbp_array_mismatch_errors: self
+                .mbp_array_mismatch_errors
+                .load(Ordering::Relaxed),
+            mbp_timestamp_errors: self.mbp_timestamp_errors.load(Ordering::Relaxed),
+            mbo_snapshot_messages: self.mbo_snapshot_messages.load(Ordering::Relaxed),
+            mbo_update_messages: self.mbo_update_messages.load(Ordering::Relaxed),
+            mbo_end_events: self.mbo_end_events.load(Ordering::Relaxed),
+            mbo_subscription_accepted: self.mbo_subscription_accepted.load(Ordering::Relaxed) > 0,
+            mbo_subscription_rejected: self.mbo_subscription_rejected.load(Ordering::Relaxed) > 0,
+            mbo_new_orders: self.mbo_new_orders.load(Ordering::Relaxed),
+            mbo_changed_orders: self.mbo_changed_orders.load(Ordering::Relaxed),
+            mbo_deleted_orders: self.mbo_deleted_orders.load(Ordering::Relaxed),
+            mbo_deletes_with_order_ids: self
+                .mbo_deletes_with_order_ids
+                .load(Ordering::Relaxed),
+            mbo_entries_with_order_ids: self.mbo_entries_with_order_ids.load(Ordering::Relaxed),
+            mbo_entries_with_priority: self.mbo_entries_with_priority.load(Ordering::Relaxed),
+            mbo_entries_with_previous_price: self
+                .mbo_entries_with_previous_price
+                .load(Ordering::Relaxed),
+            mbo_selected_price: (selected_price_bits != 0)
+                .then(|| f64::from_bits(selected_price_bits)),
+        }
     }
 }
 
@@ -386,12 +541,37 @@ impl RithmicSession {
         clock: &'static AtomicTime,
         cancel: CancellationToken,
         raw_book_metrics: Option<Arc<RawOrderBookMetrics>>,
+        probe_depth_by_order: bool,
+        depth_by_order_price: Option<f64>,
     ) -> anyhow::Result<()> {
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
         let mut book_sequence = 0_u64;
         let mut quote_cache = HashMap::<InstrumentId, QuoteState>::new();
+        let mut depth_by_order_requests = HashMap::<InstrumentId, (MarketSubscription, f64)>::new();
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await;
+
+        if probe_depth_by_order {
+            if let Some(depth_price) = depth_by_order_price {
+                anyhow::ensure!(
+                    depth_price.is_finite() && depth_price > 0.0,
+                    "Rithmic depth-by-order probe price must be positive"
+                );
+                for subscription in &subscriptions {
+                    self.request_depth_by_order(subscription, depth_price).await?;
+                    let instrument_id = InstrumentId::from(
+                        format!("{}.{}", subscription.symbol, subscription.exchange).as_str(),
+                    );
+                    depth_by_order_requests
+                        .insert(instrument_id, (subscription.clone(), depth_price));
+                }
+                if let Some(metrics) = &raw_book_metrics {
+                    metrics
+                        .mbo_selected_price_bits
+                        .store(depth_price.to_bits(), Ordering::Relaxed);
+                }
+            }
+        }
 
         loop {
             tokio::select! {
@@ -411,6 +591,9 @@ impl RithmicSession {
                         &mut book_sequence,
                         &mut quote_cache,
                         raw_book_metrics.as_ref(),
+                        probe_depth_by_order,
+                        depth_by_order_price,
+                        &mut depth_by_order_requests,
                     ).await?;
                 }
             }
@@ -418,6 +601,10 @@ impl RithmicSession {
 
         for subscription in &subscriptions {
             self.unsubscribe(subscription).await?;
+        }
+        for (_, (subscription, depth_price)) in depth_by_order_requests {
+            self.unsubscribe_depth_by_order(&subscription, depth_price)
+                .await?;
         }
         let logout = RequestLogout {
             template_id: LOGOUT_REQUEST_TEMPLATE_ID,
@@ -436,11 +623,36 @@ impl RithmicSession {
         book_sequence: &mut u64,
         quote_cache: &mut HashMap<InstrumentId, QuoteState>,
         raw_book_metrics: Option<&Arc<RawOrderBookMetrics>>,
+        probe_depth_by_order: bool,
+        configured_depth_price: Option<f64>,
+        depth_by_order_requests: &mut HashMap<
+            InstrumentId,
+            (MarketSubscription, f64),
+        >,
     ) -> anyhow::Result<()> {
         match message {
             WebSocketMessage::Binary(data) => match decode_inbound(&data)? {
                 InboundMessage::Reject(response) => {
-                    Self::ensure_codes_succeed(REJECT_TEMPLATE_ID, &response.rp_code)?;
+                    if response.user_msg.iter().any(|value| value == "mbo_probe") {
+                        if let Some(metrics) = raw_book_metrics {
+                            metrics
+                                .mbo_subscription_rejected
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Some(log) = &self.diagnostic_log {
+                            log.record(
+                                "depth_by_order_reject",
+                                "rejected",
+                                serde_json::json!({"rp_code": response.rp_code}),
+                            );
+                        }
+                        log::warn!(
+                            "Rithmic depth-by-order request rejected: {}",
+                            response.rp_code.join(": ")
+                        );
+                    } else {
+                        Self::ensure_codes_succeed(REJECT_TEMPLATE_ID, &response.rp_code)?;
+                    }
                 }
                 InboundMessage::ForcedLogout => {
                     anyhow::bail!("Rithmic forced logout received")
@@ -476,6 +688,32 @@ impl RithmicSession {
                         Ok(None) => {}
                         Err(error) => log::warn!("Ignoring invalid Rithmic BBO update: {error}"),
                     }
+                    if probe_depth_by_order && !depth_by_order_requests.contains_key(&instrument_id)
+                    {
+                        let depth_price = configured_depth_price.or_else(|| {
+                            (update.bid_price.is_finite() && update.bid_price > 0.0)
+                                .then_some(update.bid_price)
+                                .or_else(|| {
+                                    (update.ask_price.is_finite() && update.ask_price > 0.0)
+                                        .then_some(update.ask_price)
+                                })
+                        });
+                        if let Some(depth_price) = depth_price {
+                            let subscription = MarketSubscription::new(
+                                update.symbol.clone(),
+                                update.exchange.clone(),
+                                0,
+                            );
+                            self.request_depth_by_order(&subscription, depth_price).await?;
+                            depth_by_order_requests
+                                .insert(instrument_id, (subscription, depth_price));
+                            if let Some(metrics) = raw_book_metrics {
+                                metrics
+                                    .mbo_selected_price_bits
+                                    .store(depth_price.to_bits(), Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
                 InboundMessage::OrderBook(update) => {
                     if let Some(metrics) = raw_book_metrics {
@@ -491,8 +729,83 @@ impl RithmicSession {
                             Self::send_data(data_sender, Data::Deltas(Box::new(deltas)));
                         }
                         Err(error) => {
+                            if let Some(metrics) = raw_book_metrics {
+                                metrics.observe_mbp_parse_error(&error);
+                            }
                             log::warn!("Ignoring invalid Rithmic order-book update: {error}");
                         }
+                    }
+                }
+                InboundMessage::DepthByOrderSnapshot(response) => {
+                    if let Some(metrics) = raw_book_metrics {
+                        metrics.observe_mbo_snapshot(&response);
+                    }
+                    if !response.rp_code.is_empty()
+                        && !(response.rp_code.len() == 1 && response.rp_code[0] == "0")
+                    {
+                        log::warn!(
+                            "Rithmic depth-by-order snapshot failed: {}",
+                            response.rp_code.join(": ")
+                        );
+                    }
+                    if let Some(log) = &self.diagnostic_log {
+                        log.record(
+                            "depth_by_order_snapshot",
+                            if response.rp_code.is_empty()
+                                || (response.rp_code.len() == 1 && response.rp_code[0] == "0")
+                            {
+                                "received"
+                            } else {
+                                "error"
+                            },
+                            serde_json::json!({
+                                "rp_code": response.rp_code,
+                                "rq_handler_rp_code": response.rq_handler_rp_code,
+                                "exchange": response.exchange,
+                                "symbol": response.symbol,
+                                "depth_price": response.depth_price,
+                                "orders": response.exchange_order_id.len(),
+                            }),
+                        );
+                    }
+                }
+                InboundMessage::DepthByOrderResponse(response) => {
+                    let accepted = response.rp_code.len() == 1 && response.rp_code[0] == "0";
+                    if let Some(metrics) = raw_book_metrics {
+                        if accepted {
+                            metrics
+                                .mbo_subscription_accepted
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            metrics
+                                .mbo_subscription_rejected
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    if accepted {
+                        log::info!("Rithmic depth-by-order subscription accepted");
+                    } else {
+                        log::warn!(
+                            "Rithmic depth-by-order subscription rejected: {}",
+                            response.rp_code.join(": ")
+                        );
+                    }
+                    if let Some(log) = &self.diagnostic_log {
+                        log.record(
+                            "depth_by_order_subscription",
+                            if accepted { "accepted" } else { "rejected" },
+                            serde_json::json!({"rp_code": response.rp_code}),
+                        );
+                    }
+                }
+                InboundMessage::DepthByOrder(update) => {
+                    if let Some(metrics) = raw_book_metrics {
+                        metrics.observe_mbo_update(&update);
+                    }
+                }
+                InboundMessage::DepthByOrderEnd(_) => {
+                    if let Some(metrics) = raw_book_metrics {
+                        metrics.mbo_end_events.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 InboundMessage::Unsupported(template_id) => {
@@ -511,6 +824,55 @@ impl RithmicSession {
             | WebSocketMessage::Frame(_) => {}
         }
         Ok(())
+    }
+
+    async fn request_depth_by_order(
+        &mut self,
+        subscription: &MarketSubscription,
+        depth_price: f64,
+    ) -> anyhow::Result<()> {
+        let snapshot = RequestDepthByOrderSnapshot {
+            template_id: DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID,
+            user_msg: vec!["mbo_probe".to_string()],
+            symbol: subscription.symbol.clone(),
+            exchange: subscription.exchange.clone(),
+            depth_price,
+            ..Default::default()
+        };
+        Self::send_protobuf(&mut self.socket, &snapshot).await?;
+        let updates = RequestDepthByOrderUpdates {
+            template_id: DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID,
+            user_msg: vec!["mbo_probe".to_string()],
+            request: SubscriptionRequest::Subscribe as i32,
+            symbol: subscription.symbol.clone(),
+            exchange: subscription.exchange.clone(),
+            depth_price,
+            ..Default::default()
+        };
+        Self::send_protobuf(&mut self.socket, &updates).await?;
+        log::info!(
+            "Requested Rithmic depth by order for {}.{} at {depth_price}",
+            subscription.exchange,
+            subscription.symbol
+        );
+        Ok(())
+    }
+
+    async fn unsubscribe_depth_by_order(
+        &mut self,
+        subscription: &MarketSubscription,
+        depth_price: f64,
+    ) -> anyhow::Result<()> {
+        let request = RequestDepthByOrderUpdates {
+            template_id: DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID,
+            user_msg: vec!["mbo_probe".to_string()],
+            request: SubscriptionRequest::Unsubscribe as i32,
+            symbol: subscription.symbol.clone(),
+            exchange: subscription.exchange.clone(),
+            depth_price,
+            ..Default::default()
+        };
+        Self::send_protobuf(&mut self.socket, &request).await
     }
 
     async fn receive_expected(
@@ -560,6 +922,10 @@ impl RithmicSession {
             InboundMessage::LastTrade(response) => Some(response.template_id),
             InboundMessage::BestBidOffer(response) => Some(response.template_id),
             InboundMessage::OrderBook(response) => Some(response.template_id),
+            InboundMessage::DepthByOrderSnapshot(response) => Some(response.template_id),
+            InboundMessage::DepthByOrderResponse(response) => Some(response.template_id),
+            InboundMessage::DepthByOrder(response) => Some(response.template_id),
+            InboundMessage::DepthByOrderEnd(response) => Some(response.template_id),
             InboundMessage::Unsupported(template_id) => Some(*template_id),
             InboundMessage::ForcedLogout => Some(FORCED_LOGOUT_TEMPLATE_ID),
         }
@@ -799,6 +1165,43 @@ mod tests {
 
         metrics.observe(&update);
 
-        assert_eq!(metrics.snapshot(), (1, 2, 1, 1, 1));
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.messages, 1);
+        assert_eq!(snapshot.max_bid_entries, 2);
+        assert_eq!(snapshot.max_ask_entries, 1);
+        assert_eq!(snapshot.messages_with_order_counts, 1);
+        assert_eq!(snapshot.messages_with_implicit_liquidity, 1);
+    }
+
+    #[rstest]
+    fn captures_depth_by_order_identity_and_cancel_actions() {
+        let metrics = RawOrderBookMetrics::default();
+        let update = DepthByOrder {
+            update_type: vec![
+                DepthUpdateType::New as i32,
+                DepthUpdateType::Change as i32,
+                DepthUpdateType::Delete as i32,
+            ],
+            exchange_order_id: vec![
+                "order-1".to_string(),
+                "order-2".to_string(),
+                "order-3".to_string(),
+            ],
+            depth_order_priority: vec![10, 20, 30],
+            prev_depth_price_flag: vec![false, true, false],
+            ..Default::default()
+        };
+
+        metrics.observe_mbo_update(&update);
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot.mbo_update_messages, 1);
+        assert_eq!(snapshot.mbo_new_orders, 1);
+        assert_eq!(snapshot.mbo_changed_orders, 1);
+        assert_eq!(snapshot.mbo_deleted_orders, 1);
+        assert_eq!(snapshot.mbo_deletes_with_order_ids, 1);
+        assert_eq!(snapshot.mbo_entries_with_order_ids, 3);
+        assert_eq!(snapshot.mbo_entries_with_priority, 3);
+        assert_eq!(snapshot.mbo_entries_with_previous_price, 1);
     }
 }

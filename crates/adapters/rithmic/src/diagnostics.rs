@@ -77,6 +77,42 @@ pub struct RithmicConnectionProbeResult {
     pub book_messages_with_order_counts: u64,
     /// Raw book messages containing nonzero implied-liquidity metadata.
     pub book_messages_with_implicit_liquidity: u64,
+    /// Template 156 messages rejected during native MBP conversion.
+    pub mbp_parse_errors: u64,
+    /// Template 156 messages rejected for mismatched price/size arrays.
+    pub mbp_array_mismatch_errors: u64,
+    /// Template 156 messages rejected for invalid event timestamps.
+    pub mbp_timestamp_errors: u64,
+    /// Whether the dedicated depth-by-order probe was enabled.
+    pub mbo_probe_enabled: bool,
+    /// Price selected for the Rithmic depth-by-order request.
+    pub mbo_selected_price: Option<String>,
+    /// Whether Rithmic accepted the template 117 subscription.
+    pub mbo_subscription_accepted: bool,
+    /// Whether Rithmic rejected the template 117 subscription.
+    pub mbo_subscription_rejected: bool,
+    /// Number of template 116 depth-by-order snapshot messages.
+    pub mbo_snapshot_messages: u64,
+    /// Number of template 160 depth-by-order update messages.
+    pub mbo_update_messages: u64,
+    /// Number of template 161 depth-by-order end events.
+    pub mbo_end_events: u64,
+    /// Individual new orders observed in template 160 updates.
+    pub mbo_new_orders: u64,
+    /// Individual changed orders observed in template 160 updates.
+    pub mbo_changed_orders: u64,
+    /// Individual deleted orders observed in template 160 updates.
+    pub mbo_deleted_orders: u64,
+    /// Individual delete events carrying an exchange order ID.
+    pub mbo_deletes_with_order_ids: u64,
+    /// Depth-by-order entries carrying exchange order IDs.
+    pub mbo_entries_with_order_ids: u64,
+    /// Depth-by-order entries carrying queue priority.
+    pub mbo_entries_with_priority: u64,
+    /// Depth-by-order entries carrying a previous price.
+    pub mbo_entries_with_previous_price: u64,
+    /// Whether received data proves true market-by-order capability.
+    pub mbo_capable: bool,
 }
 
 #[derive(Default)]
@@ -110,6 +146,12 @@ pub async fn run_connection_probe(
         "At least one Rithmic live probe subscription is required"
     );
     let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
+    let mbo_probe_enabled = env_flag("RITHMIC_TEST_MBO");
+    let mbo_depth_price = std::env::var("RITHMIC_MBO_DEPTH_PRICE")
+        .ok()
+        .map(|value| value.parse::<f64>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid RITHMIC_MBO_DEPTH_PRICE: {e}"))?;
     let (session, resolved) = RithmicSession::connect_subscribed(
         &config.gateway_url,
         &credentials,
@@ -129,6 +171,7 @@ pub async fn run_connection_probe(
             .iter()
             .map(|subscription| format!("{}.{}", subscription.exchange, subscription.symbol))
             .collect(),
+        mbo_probe_enabled,
         ..Default::default()
     };
     let mut book_state = OrderBookProbeState::default();
@@ -145,6 +188,8 @@ pub async fn run_connection_probe(
                 get_atomic_clock_realtime(),
                 task_cancel,
                 Some(task_raw_book_metrics),
+                mbo_probe_enabled,
+                mbo_depth_price,
             )
             .await
     });
@@ -170,19 +215,39 @@ pub async fn run_connection_probe(
 
     cancel.cancel();
     session_task.await??;
-    (
-        result.raw_book_messages,
-        result.max_raw_bid_entries,
-        result.max_raw_ask_entries,
-        result.book_messages_with_order_counts,
-        result.book_messages_with_implicit_liquidity,
-    ) = raw_book_metrics.snapshot();
-    if result.order_book_type.is_none() && result.quotes > 0 {
+    let raw = raw_book_metrics.snapshot();
+    result.raw_book_messages = raw.messages;
+    result.max_raw_bid_entries = raw.max_bid_entries;
+    result.max_raw_ask_entries = raw.max_ask_entries;
+    result.book_messages_with_order_counts = raw.messages_with_order_counts;
+    result.book_messages_with_implicit_liquidity = raw.messages_with_implicit_liquidity;
+    result.mbp_parse_errors = raw.mbp_parse_errors;
+    result.mbp_array_mismatch_errors = raw.mbp_array_mismatch_errors;
+    result.mbp_timestamp_errors = raw.mbp_timestamp_errors;
+    result.mbo_selected_price = raw.mbo_selected_price.map(|price| price.to_string());
+    result.mbo_subscription_accepted = raw.mbo_subscription_accepted;
+    result.mbo_subscription_rejected = raw.mbo_subscription_rejected;
+    result.mbo_snapshot_messages = raw.mbo_snapshot_messages;
+    result.mbo_update_messages = raw.mbo_update_messages;
+    result.mbo_end_events = raw.mbo_end_events;
+    result.mbo_new_orders = raw.mbo_new_orders;
+    result.mbo_changed_orders = raw.mbo_changed_orders;
+    result.mbo_deleted_orders = raw.mbo_deleted_orders;
+    result.mbo_deletes_with_order_ids = raw.mbo_deletes_with_order_ids;
+    result.mbo_entries_with_order_ids = raw.mbo_entries_with_order_ids;
+    result.mbo_entries_with_priority = raw.mbo_entries_with_priority;
+    result.mbo_entries_with_previous_price = raw.mbo_entries_with_previous_price;
+    result.mbo_capable = result.mbo_entries_with_order_ids > 0
+        && (result.mbo_snapshot_messages > 0 || result.mbo_update_messages > 0);
+    if result.mbo_capable {
+        result.order_book_type = Some(BookType::L3_MBO);
+    } else if result.raw_book_messages > 0 {
+        result.order_book_type = Some(BookType::L2_MBP);
+    } else if result.order_book_type.is_none() && result.quotes > 0 {
         result.order_book_type = Some(BookType::L1_MBP);
     }
-    result.individual_cancels_visible = result.order_book_type == Some(BookType::L3_MBO)
-        && result.book_deletes > 0
-        && result.book_deltas_with_order_ids > 0;
+    result.individual_cancels_visible = result.mbo_capable
+        && result.mbo_deletes_with_order_ids > 0;
     write_capability_summary(&result)?;
     Ok(result)
 }
@@ -210,11 +275,35 @@ fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Re
             "book_messages_with_order_counts": result.book_messages_with_order_counts,
             "book_messages_with_implicit_liquidity":
                 result.book_messages_with_implicit_liquidity,
+            "mbp_parse_errors": result.mbp_parse_errors,
+            "mbp_array_mismatch_errors": result.mbp_array_mismatch_errors,
+            "mbp_timestamp_errors": result.mbp_timestamp_errors,
+            "mbo_probe_enabled": result.mbo_probe_enabled,
+            "mbo_selected_price": result.mbo_selected_price,
+            "mbo_subscription_accepted": result.mbo_subscription_accepted,
+            "mbo_subscription_rejected": result.mbo_subscription_rejected,
+            "mbo_snapshot_messages": result.mbo_snapshot_messages,
+            "mbo_update_messages": result.mbo_update_messages,
+            "mbo_end_events": result.mbo_end_events,
+            "mbo_new_orders": result.mbo_new_orders,
+            "mbo_changed_orders": result.mbo_changed_orders,
+            "mbo_deleted_orders": result.mbo_deleted_orders,
+            "mbo_deletes_with_order_ids": result.mbo_deletes_with_order_ids,
+            "mbo_entries_with_order_ids": result.mbo_entries_with_order_ids,
+            "mbo_entries_with_priority": result.mbo_entries_with_priority,
+            "mbo_entries_with_previous_price": result.mbo_entries_with_previous_price,
+            "mbo_capable": result.mbo_capable,
         },
     });
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{record}")?;
     Ok(())
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    })
 }
 
 fn count_event(

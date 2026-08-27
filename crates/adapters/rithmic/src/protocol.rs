@@ -35,6 +35,12 @@ pub const MARKET_DATA_REQUEST_TEMPLATE_ID: i32 = 100;
 pub const MARKET_DATA_RESPONSE_TEMPLATE_ID: i32 = 101;
 pub const FRONT_MONTH_REQUEST_TEMPLATE_ID: i32 = 113;
 pub const FRONT_MONTH_RESPONSE_TEMPLATE_ID: i32 = 114;
+pub const DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID: i32 = 115;
+pub const DEPTH_BY_ORDER_SNAPSHOT_RESPONSE_TEMPLATE_ID: i32 = 116;
+pub const DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID: i32 = 117;
+pub const DEPTH_BY_ORDER_UPDATES_RESPONSE_TEMPLATE_ID: i32 = 118;
+pub const DEPTH_BY_ORDER_TEMPLATE_ID: i32 = 160;
+pub const DEPTH_BY_ORDER_END_EVENT_TEMPLATE_ID: i32 = 161;
 
 pub const PROTOCOL_TEMPLATE_VERSION: &str = "3.9";
 
@@ -223,6 +229,139 @@ pub struct ResponseFrontMonthContract {
     pub trading_exchange: String,
 }
 
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestDepthByOrderSnapshot {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, tag = "110100")]
+    pub symbol: String,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(double, tag = "154405")]
+    pub depth_price: f64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ResponseDepthByOrderSnapshot {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, repeated, tag = "132764")]
+    pub rq_handler_rp_code: Vec<String>,
+    #[prost(string, repeated, tag = "132766")]
+    pub rp_code: Vec<String>,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(string, tag = "110100")]
+    pub symbol: String,
+    #[prost(uint64, tag = "112002")]
+    pub sequence_number: u64,
+    #[prost(enumeration = "DepthTransactionType", tag = "153612")]
+    pub depth_side: i32,
+    #[prost(double, tag = "154405")]
+    pub depth_price: f64,
+    #[prost(int32, repeated, tag = "154406")]
+    pub depth_size: Vec<i32>,
+    #[prost(uint64, repeated, tag = "153613")]
+    pub depth_order_priority: Vec<u64>,
+    #[prost(string, repeated, tag = "149238")]
+    pub exchange_order_id: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestDepthByOrderUpdates {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(enumeration = "SubscriptionRequest", tag = "100000")]
+    pub request: i32,
+    #[prost(string, tag = "110100")]
+    pub symbol: String,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(double, tag = "154405")]
+    pub depth_price: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum DepthTransactionType {
+    Unspecified = 0,
+    Buy = 1,
+    Sell = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum DepthUpdateType {
+    Unspecified = 0,
+    New = 1,
+    Change = 2,
+    Delete = 3,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DepthByOrder {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, tag = "110100")]
+    pub symbol: String,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(uint64, tag = "112002")]
+    pub sequence_number: u64,
+    #[prost(enumeration = "DepthUpdateType", repeated, tag = "110121")]
+    pub update_type: Vec<i32>,
+    #[prost(enumeration = "DepthTransactionType", repeated, tag = "153612")]
+    pub transaction_type: Vec<i32>,
+    #[prost(double, repeated, tag = "154405")]
+    pub depth_price: Vec<f64>,
+    #[prost(double, repeated, tag = "154906")]
+    pub prev_depth_price: Vec<f64>,
+    #[prost(bool, repeated, tag = "154930")]
+    pub prev_depth_price_flag: Vec<bool>,
+    #[prost(int32, repeated, tag = "154406")]
+    pub depth_size: Vec<i32>,
+    #[prost(uint64, repeated, tag = "153613")]
+    pub depth_order_priority: Vec<u64>,
+    #[prost(string, repeated, tag = "149238")]
+    pub exchange_order_id: Vec<String>,
+    #[prost(int32, tag = "150100")]
+    pub ssboe: i32,
+    #[prost(int32, tag = "150101")]
+    pub usecs: i32,
+    #[prost(int32, tag = "150400")]
+    pub source_ssboe: i32,
+    #[prost(int32, tag = "150401")]
+    pub source_usecs: i32,
+    #[prost(int32, tag = "150404")]
+    pub source_nsecs: i32,
+    #[prost(int32, tag = "150600")]
+    pub jop_ssboe: i32,
+    #[prost(int32, tag = "150604")]
+    pub jop_nsecs: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DepthByOrderEndEvent {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "110100")]
+    pub symbol: Vec<String>,
+    #[prost(string, repeated, tag = "110101")]
+    pub exchange: Vec<String>,
+    #[prost(uint64, tag = "112002")]
+    pub sequence_number: u64,
+    #[prost(int32, tag = "150100")]
+    pub ssboe: i32,
+    #[prost(int32, tag = "150101")]
+    pub usecs: i32,
+}
+
 /// Minimal common projection used to dispatch a protobuf frame by template ID.
 #[derive(Clone, PartialEq, Message)]
 pub struct Base {
@@ -400,6 +539,10 @@ pub enum InboundMessage {
     LastTrade(LastTrade),
     BestBidOffer(BestBidOffer),
     OrderBook(OrderBook),
+    DepthByOrderSnapshot(ResponseDepthByOrderSnapshot),
+    DepthByOrderResponse(ResponseCode),
+    DepthByOrder(DepthByOrder),
+    DepthByOrderEnd(DepthByOrderEndEvent),
     Reject(ResponseCode),
     ForcedLogout,
     Unsupported(i32),
@@ -431,6 +574,18 @@ pub fn decode_inbound(frame: &[u8]) -> anyhow::Result<InboundMessage> {
         LAST_TRADE_TEMPLATE_ID => InboundMessage::LastTrade(LastTrade::decode(payload)?),
         BBO_TEMPLATE_ID => InboundMessage::BestBidOffer(BestBidOffer::decode(payload)?),
         ORDER_BOOK_TEMPLATE_ID => InboundMessage::OrderBook(OrderBook::decode(payload)?),
+        DEPTH_BY_ORDER_SNAPSHOT_RESPONSE_TEMPLATE_ID => {
+            InboundMessage::DepthByOrderSnapshot(ResponseDepthByOrderSnapshot::decode(payload)?)
+        }
+        DEPTH_BY_ORDER_UPDATES_RESPONSE_TEMPLATE_ID => {
+            InboundMessage::DepthByOrderResponse(ResponseCode::decode(payload)?)
+        }
+        DEPTH_BY_ORDER_TEMPLATE_ID => {
+            InboundMessage::DepthByOrder(DepthByOrder::decode(payload)?)
+        }
+        DEPTH_BY_ORDER_END_EVENT_TEMPLATE_ID => {
+            InboundMessage::DepthByOrderEnd(DepthByOrderEndEvent::decode(payload)?)
+        }
         REJECT_TEMPLATE_ID => InboundMessage::Reject(ResponseCode::decode(payload)?),
         FORCED_LOGOUT_TEMPLATE_ID => InboundMessage::ForcedLogout,
         _ => InboundMessage::Unsupported(template_id),
@@ -489,5 +644,30 @@ mod tests {
         };
         assert_eq!(decoded.symbol, "MESU6");
         assert_eq!(decoded.ask_price, 6_000.25);
+    }
+
+    #[rstest]
+    fn decodes_depth_by_order_update_with_order_identity() {
+        let update = DepthByOrder {
+            template_id: DEPTH_BY_ORDER_TEMPLATE_ID,
+            symbol: "MESU6".to_string(),
+            exchange: "CME".to_string(),
+            sequence_number: 42,
+            update_type: vec![DepthUpdateType::Delete as i32],
+            transaction_type: vec![DepthTransactionType::Buy as i32],
+            depth_price: vec![6_000.25],
+            depth_size: vec![3],
+            depth_order_priority: vec![99],
+            exchange_order_id: vec!["exchange-order-1".to_string()],
+            ..Default::default()
+        };
+
+        let decoded = decode_inbound(&encode_frame(&update)).unwrap();
+        let InboundMessage::DepthByOrder(decoded) = decoded else {
+            panic!("Expected depth-by-order update")
+        };
+        assert_eq!(decoded.sequence_number, 42);
+        assert_eq!(decoded.update_type, vec![DepthUpdateType::Delete as i32]);
+        assert_eq!(decoded.exchange_order_id, vec!["exchange-order-1"]);
     }
 }

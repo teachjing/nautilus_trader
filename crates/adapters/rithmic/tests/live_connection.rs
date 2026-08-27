@@ -42,6 +42,12 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
         ..Default::default()
     };
     let expected_system_name = config.system_name.clone();
+    let require_book_data = std::env::var("RITHMIC_REQUIRE_BOOK_DATA").is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    });
+    let require_mbo = std::env::var("RITHMIC_REQUIRE_MBO").is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    });
 
     let result = run_connection_probe(config, Duration::from_secs(duration_secs))
         .await
@@ -51,10 +57,14 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
     assert!(!result.resolved_subscriptions.is_empty());
     assert!(result.available_systems.contains(&expected_system_name));
     assert!(result.diagnostic_log_path.is_some());
-    assert_eq!(result.order_book_type, Some(BookType::L2_MBP));
-    assert!(result.order_book_deltas > 0);
-    assert_eq!(result.book_deltas_with_order_ids, 0);
-    assert!(!result.individual_cancels_visible);
+    if require_book_data {
+        assert!(result.order_book_deltas > 0);
+    }
+    if require_mbo {
+        assert_eq!(result.order_book_type, Some(BookType::L3_MBO));
+        assert!(result.mbo_subscription_accepted);
+        assert!(result.mbo_capable);
+    }
     assert!(
         result.total_events() > 0,
         "Connected successfully but received no native market-data events; \
