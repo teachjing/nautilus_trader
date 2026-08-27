@@ -198,10 +198,25 @@ top-level properties are retained as generic correlation metadata. Adapter-speci
 inside the nested `options` property bag; only the Rithmic adapter interprets them, so they do not
 become HTTP query parameters or expand Nautilus's generic historical request surface.
 
+The native `RithmicDataClient::request_bars` implementation maps Nautilus external LAST time bars
+onto the same Rithmic interval families. Requests are serialized through one shared History Plant
+worker and returned as `BarsResponse` events through the Nautilus data engine. Adapter controls are
+read from `RequestBars.params["options"]`; for example:
+
+```json
+{
+  "options": {
+    "max_pages": 25
+  }
+}
+```
+
+The worker opens at most one History Plant socket, reuses it across requests, and discards the
+session after a replay failure so the next queued request reconnects cleanly.
+
 ## Remaining adapter work
 
 - Convert the discovery catalog into full Nautilus `FuturesContract` definitions.
-- Route Nautilus historical `request_bars` commands through the History Plant client.
 - Add tick replay templates 206/207 and conversion to historical `TradeTick` data.
 - Validate and map Market Mode (157), End Of Day Prices (155), and Indicator Prices (154).
 - Decide which Rithmic-only statistics should become registered `CustomData` schemas.

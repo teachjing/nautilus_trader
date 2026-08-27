@@ -823,6 +823,10 @@ impl RithmicSession {
         Ok(())
     }
 
+    pub(crate) async fn send_heartbeat(&mut self) -> anyhow::Result<()> {
+        Self::send_protobuf(&mut self.socket, &heartbeat_request(0, 0)).await
+    }
+
     pub(crate) async fn connect_history(
         gateway_url: &str,
         credentials: &LoginCredentials,

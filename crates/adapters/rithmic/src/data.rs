@@ -17,19 +17,42 @@ use std::{
 use nautilus_common::{
     clients::DataClient,
     live::{get_runtime, runner::get_data_event_sender},
-    messages::DataEvent,
+    messages::{
+        DataEvent,
+        data::{BarsResponse, DataResponse, RequestBars},
+    },
 };
-use nautilus_core::time::{AtomicTime, get_atomic_clock_realtime};
-use nautilus_model::identifiers::{ClientId, Venue};
+use nautilus_core::{
+    datetime::datetime_to_unix_nanos,
+    time::{AtomicTime, get_atomic_clock_realtime},
+};
+use nautilus_model::{
+    data::Bar,
+    enums::{AggregationSource, BarAggregation, PriceType},
+    identifiers::{ClientId, Venue},
+};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::RithmicDataClientConfig,
     flow::{LoginCredentials, MarketSubscription},
+    history::RithmicHistoricalBarType,
     protocol::update_bits,
     session::{ReconnectBackoff, RithmicSession},
 };
+
+#[derive(Debug)]
+struct HistoryRequest {
+    exchange: String,
+    symbol: String,
+    bar_type: RithmicHistoricalBarType,
+    period: u32,
+    start_seconds: i32,
+    finish_seconds: i32,
+    max_pages: usize,
+    response: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Bar>>>,
+}
 
 /// Native Rithmic market-data client registered with the Nautilus DataEngine.
 #[derive(Debug)]
@@ -40,6 +63,9 @@ pub struct RithmicDataClient {
     connected: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
     session_task: Option<JoinHandle<()>>,
+    history_task: Option<JoinHandle<()>>,
+    history_sender: tokio::sync::mpsc::UnboundedSender<HistoryRequest>,
+    history_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<HistoryRequest>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     clock: &'static AtomicTime,
 }
@@ -72,6 +98,7 @@ impl RithmicDataClient {
             "Rithmic initial reconnect delay cannot exceed maximum delay"
         );
 
+        let (history_sender, history_receiver) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             client_id,
             venue: Venue::from("CME"),
@@ -79,6 +106,9 @@ impl RithmicDataClient {
             connected: Arc::new(AtomicBool::new(false)),
             cancellation_token: CancellationToken::new(),
             session_task: None,
+            history_task: None,
+            history_sender,
+            history_receiver: Some(history_receiver),
             data_sender: get_data_event_sender(),
             clock: get_atomic_clock_realtime(),
         })
@@ -127,6 +157,12 @@ impl RithmicDataClient {
             .map(|value| parse_subscription(value, bits))
             .collect()
     }
+
+    fn reset_history_channel(&mut self) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        self.history_sender = sender;
+        self.history_receiver = Some(receiver);
+    }
 }
 
 fn parse_subscription(value: &str, bits: u32) -> anyhow::Result<MarketSubscription> {
@@ -141,6 +177,106 @@ fn parse_subscription(value: &str, bits: u32) -> anyhow::Result<MarketSubscripti
         "Invalid Rithmic subscription '{value}': expected EXCHANGE.SYMBOL"
     );
     Ok(MarketSubscription::new(symbol, exchange, bits))
+}
+
+async fn run_history_worker(
+    gateway_url: String,
+    credentials: LoginCredentials,
+    diagnostic_log_dir: Option<String>,
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<HistoryRequest>,
+    cancel: CancellationToken,
+    clock: &'static AtomicTime,
+) {
+    let mut session: Option<RithmicSession> = None;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    loop {
+        let request = tokio::select! {
+            () = cancel.cancelled() => None,
+            request = receiver.recv() => request,
+            _ = heartbeat.tick() => {
+                if let Some(active) = &mut session
+                    && let Err(error) = active.send_heartbeat().await
+                {
+                    log::warn!("Rithmic History Plant heartbeat failed: {error:#}");
+                    session = None;
+                }
+                continue;
+            },
+        };
+        let Some(request) = request else { break };
+        if session.is_none() {
+            match RithmicSession::connect_history(
+                &gateway_url,
+                &credentials,
+                diagnostic_log_dir.as_deref(),
+            )
+            .await
+            {
+                Ok(connected) => session = Some(connected),
+                Err(error) => {
+                    let _ = request.response.send(Err(error));
+                    continue;
+                }
+            }
+        }
+        let result = session
+            .as_mut()
+            .expect("History Plant session initialized")
+            .replay_time_bars(
+                &request.exchange,
+                &request.symbol,
+                request.bar_type,
+                request.period,
+                request.start_seconds,
+                request.finish_seconds,
+                request.max_pages,
+                clock,
+            )
+            .await
+            .map(|(bars, _)| bars);
+        if result.is_err() {
+            session = None;
+        }
+        let _ = request.response.send(result);
+    }
+    if let Some(mut session) = session {
+        let _ = session.logout_and_close().await;
+    }
+}
+
+fn map_historical_bar_type(
+    aggregation: BarAggregation,
+) -> anyhow::Result<RithmicHistoricalBarType> {
+    match aggregation {
+        BarAggregation::Second => Ok(RithmicHistoricalBarType::Second),
+        BarAggregation::Minute => Ok(RithmicHistoricalBarType::Minute),
+        BarAggregation::Day => Ok(RithmicHistoricalBarType::Daily),
+        BarAggregation::Week => Ok(RithmicHistoricalBarType::Weekly),
+        _ => anyhow::bail!("Rithmic does not support historical {aggregation:?} bars"),
+    }
+}
+
+fn interval_seconds(bar_type: RithmicHistoricalBarType, period: u32) -> i64 {
+    let unit = match bar_type {
+        RithmicHistoricalBarType::Second => 1,
+        RithmicHistoricalBarType::Minute => 60,
+        RithmicHistoricalBarType::Daily => 86_400,
+        RithmicHistoricalBarType::Weekly => 604_800,
+    };
+    i64::from(period) * unit
+}
+
+fn rithmic_history_max_pages(params: Option<&nautilus_core::Params>) -> usize {
+    params
+        .and_then(|params| params.get("options"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|options| options.get("max_pages"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10)
 }
 
 #[async_trait::async_trait(?Send)]
@@ -163,6 +299,9 @@ impl DataClient for RithmicDataClient {
         if let Some(handle) = self.session_task.take() {
             handle.abort();
         }
+        if let Some(handle) = self.history_task.take() {
+            handle.abort();
+        }
         self.connected.store(false, Ordering::Release);
         Ok(())
     }
@@ -170,6 +309,7 @@ impl DataClient for RithmicDataClient {
     fn reset(&mut self) -> anyhow::Result<()> {
         self.stop()?;
         self.cancellation_token = CancellationToken::new();
+        self.reset_history_channel();
         Ok(())
     }
 
@@ -215,6 +355,24 @@ impl DataClient for RithmicDataClient {
         let connected = Arc::clone(&self.connected);
         let data_sender = self.data_sender.clone();
         let clock = self.clock;
+        if self.history_task.is_none() {
+            let history_receiver = self
+                .history_receiver
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("Rithmic History Plant worker is unavailable"))?;
+            let history_cancel = cancel.clone();
+            let history_gateway_url = gateway_url.clone();
+            let history_credentials = credentials.clone();
+            let history_diagnostic_log_dir = diagnostic_log_dir.clone();
+            self.history_task = Some(get_runtime().spawn(run_history_worker(
+                history_gateway_url,
+                history_credentials,
+                history_diagnostic_log_dir,
+                history_receiver,
+                history_cancel,
+                clock,
+            )));
+        }
         connected.store(true, Ordering::Release);
         self.session_task = Some(get_runtime().spawn(async move {
             let mut active_session = Some((session, resolved_subscriptions));
@@ -291,7 +449,98 @@ impl DataClient for RithmicDataClient {
         if let Some(handle) = self.session_task.take() {
             handle.await?;
         }
+        if let Some(handle) = self.history_task.take() {
+            handle.await?;
+        }
         self.connected.store(false, Ordering::Release);
+        self.cancellation_token = CancellationToken::new();
+        self.reset_history_channel();
+        Ok(())
+    }
+
+    fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
+        let bar_type = request.bar_type;
+        anyhow::ensure!(
+            bar_type.aggregation_source() == AggregationSource::External,
+            "Rithmic historical bars require EXTERNAL aggregation (got {bar_type})"
+        );
+        anyhow::ensure!(
+            bar_type.spec().price_type == PriceType::Last,
+            "Rithmic historical bars require LAST price type (got {bar_type})"
+        );
+        let historical_type = map_historical_bar_type(bar_type.spec().aggregation)?;
+        let period = bar_type.spec().step.get();
+        let period = u32::try_from(period)
+            .map_err(|_| anyhow::anyhow!("Rithmic historical bar period is too large"))?;
+        let instrument_id = bar_type.instrument_id();
+        let symbol = instrument_id.symbol.to_string();
+        let exchange = instrument_id.venue.to_string();
+        let now_seconds = (self.clock.get_time_ns().as_u64() / 1_000_000_000)
+            .min(i32::MAX as u64) as i32;
+        let finish_seconds = request
+            .end
+            .map_or(i64::from(now_seconds), |value| value.as_second());
+        let requested_limit = request.limit.map(|value| value.get());
+        let default_count = requested_limit.unwrap_or(1_000);
+        let default_span = interval_seconds(historical_type, period)
+            .saturating_mul(i64::try_from(default_count).unwrap_or(i64::MAX));
+        let start_seconds = request
+            .start
+            .map_or_else(|| finish_seconds.saturating_sub(default_span), |value| value.as_second());
+        let start_seconds = i32::try_from(start_seconds)
+            .map_err(|_| anyhow::anyhow!("Rithmic historical start is outside epoch-second range"))?;
+        let finish_seconds = i32::try_from(finish_seconds)
+            .map_err(|_| anyhow::anyhow!("Rithmic historical end is outside epoch-second range"))?;
+        anyhow::ensure!(finish_seconds > start_seconds, "Rithmic historical range is invalid");
+        let max_pages = rithmic_history_max_pages(request.params.as_ref());
+        let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+        self.history_sender
+            .send(HistoryRequest {
+                exchange,
+                symbol,
+                bar_type: historical_type,
+                period,
+                start_seconds,
+                finish_seconds,
+                max_pages,
+                response: response_sender,
+            })
+            .map_err(|_| anyhow::anyhow!("Rithmic History Plant worker is unavailable"))?;
+
+        let sender = self.data_sender.clone();
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let request_id = request.request_id;
+        let params = request.params;
+        let start = datetime_to_unix_nanos(request.start);
+        let end = datetime_to_unix_nanos(request.end);
+        let clock = self.clock;
+        get_runtime().spawn(async move {
+            match response_receiver.await {
+                Ok(Ok(mut bars)) => {
+                    if let Some(limit) = requested_limit
+                        && bars.len() > limit
+                    {
+                        let drop_count = bars.len() - limit;
+                        bars.drain(..drop_count);
+                    }
+                    let response = DataResponse::Bars(BarsResponse::new(
+                        request_id,
+                        client_id,
+                        bar_type,
+                        bars,
+                        start,
+                        end,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+                    if let Err(error) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send Rithmic bars response: {error}");
+                    }
+                }
+                Ok(Err(error)) => log::error!("Rithmic historical bars request failed: {error:#}"),
+                Err(_) => log::error!("Rithmic History Plant response channel closed"),
+            }
+        });
         Ok(())
     }
 }
@@ -319,5 +568,31 @@ mod tests {
     #[case("CME.MES.U6")]
     fn rejects_invalid_subscription(#[case] value: &str) {
         assert!(parse_subscription(value, update_bits::LAST_TRADE).is_err());
+    }
+
+    #[rstest]
+    #[case(BarAggregation::Second, RithmicHistoricalBarType::Second)]
+    #[case(BarAggregation::Minute, RithmicHistoricalBarType::Minute)]
+    #[case(BarAggregation::Day, RithmicHistoricalBarType::Daily)]
+    #[case(BarAggregation::Week, RithmicHistoricalBarType::Weekly)]
+    fn maps_nautilus_historical_bar_aggregation(
+        #[case] aggregation: BarAggregation,
+        #[case] expected: RithmicHistoricalBarType,
+    ) {
+        assert_eq!(map_historical_bar_type(aggregation).unwrap(), expected);
+    }
+
+    #[rstest]
+    fn reads_rithmic_history_options_from_nested_property_bag() {
+        let params: nautilus_core::Params = serde_json::from_value(serde_json::json!({
+            "options": {
+                "max_pages": 25,
+                "future_option": true
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(rithmic_history_max_pages(Some(&params)), 25);
+        assert_eq!(params["options"]["future_option"], true);
     }
 }
