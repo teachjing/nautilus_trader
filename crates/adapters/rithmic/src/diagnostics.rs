@@ -381,15 +381,16 @@ fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Re
     let Some(path) = &result.diagnostic_log_path else {
         return Ok(());
     };
-    let record = serde_json::json!({
-        "stage": "order_book_capabilities",
-        "status": "observed",
-        "details": {
+    // Build the large details object in smaller groups. A single deeply nested
+    // `json!` invocation can exceed rustc's default macro recursion limit.
+    let mut details = serde_json::json!({
             "order_book_type": result.order_book_type.map(|value| value.to_string()),
             "discovery_catalog_path": result.discovery_catalog_path,
             "discovered_exchanges": result.discovered_exchanges,
             "entitled_exchanges": result.entitled_exchanges,
             "discovered_instruments": result.discovered_instruments,
+    });
+    let capacity = serde_json::json!({
             "plant_capacity_probe_enabled": result.plant_capacity_probe_enabled,
             "order_with_ticker_connected": result.order_with_ticker_connected,
             "history_with_ticker_and_order_connected": result.history_with_ticker_and_order_connected,
@@ -397,6 +398,8 @@ fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Re
             "order_connection_error": result.order_connection_error,
             "history_with_order_connection_error": result.history_with_order_connection_error,
             "history_ticker_only_connection_error": result.history_ticker_only_connection_error,
+    });
+    let market_by_price = serde_json::json!({
             "max_bid_levels": result.max_bid_levels,
             "max_ask_levels": result.max_ask_levels,
             "book_adds": result.book_adds,
@@ -414,6 +417,8 @@ fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Re
             "mbp_parse_errors": result.mbp_parse_errors,
             "mbp_array_mismatch_errors": result.mbp_array_mismatch_errors,
             "mbp_timestamp_errors": result.mbp_timestamp_errors,
+    });
+    let market_by_order = serde_json::json!({
             "mbo_probe_enabled": result.mbo_probe_enabled,
             "mbo_selected_price": result.mbo_selected_price,
             "mbo_subscription_accepted": result.mbo_subscription_accepted,
@@ -429,7 +434,32 @@ fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Re
             "mbo_entries_with_priority": result.mbo_entries_with_priority,
             "mbo_entries_with_previous_price": result.mbo_entries_with_previous_price,
             "mbo_capable": result.mbo_capable,
-        },
+    });
+    let details = details
+        .as_object_mut()
+        .expect("Rithmic diagnostic details must be a JSON object");
+    details.extend(
+        capacity
+            .as_object()
+            .expect("Rithmic capacity details must be a JSON object")
+            .clone(),
+    );
+    details.extend(
+        market_by_price
+            .as_object()
+            .expect("Rithmic MBP details must be a JSON object")
+            .clone(),
+    );
+    details.extend(
+        market_by_order
+            .as_object()
+            .expect("Rithmic MBO details must be a JSON object")
+            .clone(),
+    );
+    let record = serde_json::json!({
+        "stage": "order_book_capabilities",
+        "status": "observed",
+        "details": details,
     });
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{record}")?;
