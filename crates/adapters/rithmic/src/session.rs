@@ -38,6 +38,38 @@ use crate::{
 
 type RithmicWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReconnectBackoff {
+    initial: Duration,
+    maximum: Duration,
+    next: Duration,
+}
+
+impl ReconnectBackoff {
+    pub(crate) fn new(initial: Duration, maximum: Duration) -> anyhow::Result<Self> {
+        anyhow::ensure!(!initial.is_zero(), "Reconnect delay must be positive");
+        anyhow::ensure!(
+            initial <= maximum,
+            "Initial reconnect delay cannot exceed maximum delay"
+        );
+        Ok(Self {
+            initial,
+            maximum,
+            next: initial,
+        })
+    }
+
+    pub(crate) fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_add(self.initial).min(self.maximum);
+        delay
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.next = self.initial;
+    }
+}
+
 pub(crate) struct RithmicSession {
     socket: RithmicWebSocket,
     heartbeat_interval: Duration,
@@ -52,7 +84,7 @@ impl Debug for RithmicSession {
 }
 
 impl RithmicSession {
-    pub(crate) async fn connect(
+    async fn connect_inner(
         gateway_url: &str,
         credentials: &LoginCredentials,
     ) -> anyhow::Result<Self> {
@@ -81,6 +113,23 @@ impl RithmicSession {
             socket,
             heartbeat_interval,
         })
+    }
+
+    pub(crate) async fn connect_subscribed(
+        gateway_url: &str,
+        credentials: &LoginCredentials,
+        subscriptions: &[MarketSubscription],
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        tokio::time::timeout(timeout, async {
+            let mut session = Self::connect_inner(gateway_url, credentials).await?;
+            for subscription in subscriptions {
+                session.subscribe(subscription).await?;
+            }
+            Ok(session)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Rithmic setup timed out after {timeout:?}"))?
     }
 
     async fn discover_systems(gateway_url: &str) -> anyhow::Result<ResponseSystemInfo> {
@@ -310,5 +359,48 @@ impl RithmicSession {
         if let Err(error) = sender.send(DataEvent::Data(data)) {
             log::error!("Failed to emit Rithmic data event: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn reconnect_backoff_increases_linearly_and_caps() {
+        let mut backoff = ReconnectBackoff::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        assert_eq!(backoff.next_delay(), Duration::from_secs(10));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(20));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(30));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(30));
+    }
+
+    #[rstest]
+    fn reconnect_backoff_resets_after_success() {
+        let mut backoff = ReconnectBackoff::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        backoff.next_delay();
+        backoff.next_delay();
+        backoff.reset();
+
+        assert_eq!(backoff.next_delay(), Duration::from_secs(10));
+    }
+
+    #[rstest]
+    fn reconnect_backoff_rejects_invalid_bounds() {
+        assert!(ReconnectBackoff::new(Duration::ZERO, Duration::from_secs(30)).is_err());
+        assert!(
+            ReconnectBackoff::new(Duration::from_secs(31), Duration::from_secs(30)).is_err()
+        );
     }
 }

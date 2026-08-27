@@ -45,6 +45,15 @@ pub struct RithmicDataClientConfig {
     /// Request last-trade updates.
     #[builder(default = true)]
     pub subscribe_trades: bool,
+    /// Timeout for discovery, login, and subscription setup.
+    #[builder(default = 30)]
+    pub connect_timeout_secs: u64,
+    /// Initial delay before reconnecting a dropped ticker-plant session.
+    #[builder(default = 10)]
+    pub reconnect_delay_initial_secs: u64,
+    /// Maximum delay between ticker-plant reconnect attempts.
+    #[builder(default = 120)]
+    pub reconnect_delay_max_secs: u64,
 }
 
 impl Debug for RithmicDataClientConfig {
@@ -59,6 +68,15 @@ impl Debug for RithmicDataClientConfig {
             .field("subscribe_book_deltas", &self.subscribe_book_deltas)
             .field("subscribe_quotes", &self.subscribe_quotes)
             .field("subscribe_trades", &self.subscribe_trades)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field(
+                "reconnect_delay_initial_secs",
+                &self.reconnect_delay_initial_secs,
+            )
+            .field(
+                "reconnect_delay_max_secs",
+                &self.reconnect_delay_max_secs,
+            )
             .finish()
     }
 }
@@ -81,6 +99,9 @@ nautilus_core::impl_pyo3_config_getters!(RithmicDataClientConfig {
     subscribe_book_deltas: bool,
     subscribe_quotes: bool,
     subscribe_trades: bool,
+    connect_timeout_secs: u64,
+    reconnect_delay_initial_secs: u64,
+    reconnect_delay_max_secs: u64,
 });
 
 #[cfg(test)]
@@ -97,6 +118,9 @@ mod tests {
         assert!(config.subscribe_book_deltas);
         assert!(config.subscribe_quotes);
         assert!(config.subscribe_trades);
+        assert_eq!(config.connect_timeout_secs, 30);
+        assert_eq!(config.reconnect_delay_initial_secs, 10);
+        assert_eq!(config.reconnect_delay_max_secs, 120);
     }
 
     #[rstest]

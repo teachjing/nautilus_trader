@@ -33,6 +33,9 @@ impl RithmicDataClientConfig {
         subscribe_book_deltas = None,
         subscribe_quotes = None,
         subscribe_trades = None,
+        connect_timeout_secs = None,
+        reconnect_delay_initial_secs = None,
+        reconnect_delay_max_secs = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
@@ -45,6 +48,9 @@ impl RithmicDataClientConfig {
         subscribe_book_deltas: Option<bool>,
         subscribe_quotes: Option<bool>,
         subscribe_trades: Option<bool>,
+        connect_timeout_secs: Option<u64>,
+        reconnect_delay_initial_secs: Option<u64>,
+        reconnect_delay_max_secs: Option<u64>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -58,6 +64,11 @@ impl RithmicDataClientConfig {
                 .unwrap_or(defaults.subscribe_book_deltas),
             subscribe_quotes: subscribe_quotes.unwrap_or(defaults.subscribe_quotes),
             subscribe_trades: subscribe_trades.unwrap_or(defaults.subscribe_trades),
+            connect_timeout_secs: connect_timeout_secs.unwrap_or(defaults.connect_timeout_secs),
+            reconnect_delay_initial_secs: reconnect_delay_initial_secs
+                .unwrap_or(defaults.reconnect_delay_initial_secs),
+            reconnect_delay_max_secs: reconnect_delay_max_secs
+                .unwrap_or(defaults.reconnect_delay_max_secs),
         }
     }
 

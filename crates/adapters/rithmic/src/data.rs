@@ -6,9 +6,12 @@
 //  You may not use this file except in compliance with the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use nautilus_common::{
@@ -25,7 +28,7 @@ use crate::{
     config::RithmicDataClientConfig,
     flow::{LoginCredentials, MarketSubscription},
     protocol::update_bits,
-    session::RithmicSession,
+    session::{ReconnectBackoff, RithmicSession},
 };
 
 /// Native Rithmic market-data client registered with the Nautilus DataEngine.
@@ -55,6 +58,18 @@ impl RithmicDataClient {
         anyhow::ensure!(
             has_password,
             "Rithmic password missing: set config or RITHMIC_PASSWORD"
+        );
+        anyhow::ensure!(
+            config.connect_timeout_secs > 0,
+            "Rithmic connect timeout must be positive"
+        );
+        anyhow::ensure!(
+            config.reconnect_delay_initial_secs > 0,
+            "Rithmic initial reconnect delay must be positive"
+        );
+        anyhow::ensure!(
+            config.reconnect_delay_initial_secs <= config.reconnect_delay_max_secs,
+            "Rithmic initial reconnect delay cannot exceed maximum delay"
         );
 
         Ok(Self {
@@ -177,10 +192,17 @@ impl DataClient for RithmicDataClient {
 
         let credentials = self.credentials()?;
         let subscriptions = self.subscriptions()?;
-        let mut session = RithmicSession::connect(&self.config.gateway_url, &credentials).await?;
-        for subscription in &subscriptions {
-            session.subscribe(subscription).await?;
-        }
+        let gateway_url = self.config.gateway_url.clone();
+        let connect_timeout = Duration::from_secs(self.config.connect_timeout_secs);
+        let initial_delay = Duration::from_secs(self.config.reconnect_delay_initial_secs);
+        let maximum_delay = Duration::from_secs(self.config.reconnect_delay_max_secs);
+        let session = RithmicSession::connect_subscribed(
+            &gateway_url,
+            &credentials,
+            &subscriptions,
+            connect_timeout,
+        )
+        .await?;
 
         if self.cancellation_token.is_cancelled() {
             self.cancellation_token = CancellationToken::new();
@@ -191,11 +213,61 @@ impl DataClient for RithmicDataClient {
         let clock = self.clock;
         connected.store(true, Ordering::Release);
         self.session_task = Some(get_runtime().spawn(async move {
-            if let Err(error) = session
-                .run(subscriptions, data_sender, clock, cancel)
-                .await
-            {
-                log::error!("Rithmic session stopped: {error:#}");
+            let mut active_session = session;
+            let mut backoff = ReconnectBackoff::new(initial_delay, maximum_delay)
+                .expect("validated Rithmic reconnect delays");
+
+            loop {
+                let result = active_session
+                    .run(
+                        subscriptions.clone(),
+                        data_sender.clone(),
+                        clock,
+                        cancel.clone(),
+                    )
+                    .await;
+                connected.store(false, Ordering::Release);
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if let Err(error) = result {
+                    log::warn!("Rithmic session disconnected: {error:#}");
+                }
+
+                loop {
+                    let delay = backoff.next_delay();
+                    log::info!("Reconnecting Rithmic ticker plant in {delay:?}");
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+
+                    match RithmicSession::connect_subscribed(
+                        &gateway_url,
+                        &credentials,
+                        &subscriptions,
+                        connect_timeout,
+                    )
+                    .await
+                    {
+                        Ok(session) => {
+                            active_session = session;
+                            backoff.reset();
+                            connected.store(true, Ordering::Release);
+                            log::info!("Rithmic ticker plant reconnected and resubscribed");
+                            break;
+                        }
+                        Err(error) => {
+                            log::warn!("Rithmic reconnect attempt failed: {error:#}");
+                        }
+                    }
+                }
+                if cancel.is_cancelled() {
+                    break;
+                }
             }
             connected.store(false, Ordering::Release);
         }));
