@@ -23,5 +23,7 @@ pub mod factories;
 pub mod flow;
 pub mod protocol;
 
+mod session;
+
 #[cfg(feature = "python")]
 pub mod python;

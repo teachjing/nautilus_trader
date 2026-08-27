@@ -47,6 +47,14 @@ pub struct RequestSystemInfo {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct RequestLogout {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct ResponseSystemInfo {
     #[prost(int32, tag = "154467")]
     pub template_id: i32,

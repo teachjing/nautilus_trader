@@ -27,14 +27,28 @@ pub struct MarketSubscription {
 }
 
 impl MarketSubscription {
-    /// Creates a trades, quotes, and market-by-price subscription.
+    /// Creates a subscription for the requested Rithmic update types.
     #[must_use]
-    pub fn all_market_data(symbol: impl Into<String>, exchange: impl Into<String>) -> Self {
+    pub fn new(
+        symbol: impl Into<String>,
+        exchange: impl Into<String>,
+        update_bits: u32,
+    ) -> Self {
         Self {
             symbol: symbol.into(),
             exchange: exchange.into(),
-            update_bits: update_bits::LAST_TRADE | update_bits::BBO | update_bits::ORDER_BOOK,
+            update_bits,
         }
+    }
+
+    /// Creates a trades, quotes, and market-by-price subscription.
+    #[must_use]
+    pub fn all_market_data(symbol: impl Into<String>, exchange: impl Into<String>) -> Self {
+        Self::new(
+            symbol,
+            exchange,
+            update_bits::LAST_TRADE | update_bits::BBO | update_bits::ORDER_BOOK,
+        )
     }
 
     #[must_use]
