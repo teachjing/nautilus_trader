@@ -33,6 +33,7 @@ impl RithmicDataClientConfig {
         diagnostic_log_dir = None,
         rollover_days = None,
         subscribe_book_deltas = None,
+        subscribe_mbo = None,
         subscribe_quotes = None,
         subscribe_trades = None,
         connect_timeout_secs = None,
@@ -50,6 +51,7 @@ impl RithmicDataClientConfig {
         diagnostic_log_dir: Option<String>,
         rollover_days: Option<u16>,
         subscribe_book_deltas: Option<bool>,
+        subscribe_mbo: Option<bool>,
         subscribe_quotes: Option<bool>,
         subscribe_trades: Option<bool>,
         connect_timeout_secs: Option<u64>,
@@ -68,6 +70,7 @@ impl RithmicDataClientConfig {
             rollover_days: rollover_days.unwrap_or(defaults.rollover_days),
             subscribe_book_deltas: subscribe_book_deltas
                 .unwrap_or(defaults.subscribe_book_deltas),
+            subscribe_mbo: subscribe_mbo.unwrap_or(defaults.subscribe_mbo),
             subscribe_quotes: subscribe_quotes.unwrap_or(defaults.subscribe_quotes),
             subscribe_trades: subscribe_trades.unwrap_or(defaults.subscribe_trades),
             connect_timeout_secs: connect_timeout_secs.unwrap_or(defaults.connect_timeout_secs),

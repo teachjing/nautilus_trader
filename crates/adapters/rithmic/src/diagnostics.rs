@@ -338,7 +338,11 @@ pub async fn run_connection_probe(
         "At least one Rithmic live probe subscription is required"
     );
     let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
-    let mbo_probe_enabled = env_flag("RITHMIC_TEST_MBO");
+    let mbo_probe_enabled = config.subscribe_mbo || env_flag("RITHMIC_TEST_MBO");
+    anyhow::ensure!(
+        !(mbo_probe_enabled && config.subscribe_book_deltas),
+        "Rithmic L2 market-by-price and L3 market-by-order subscriptions are mutually exclusive"
+    );
     let discover_markets = env_flag("RITHMIC_DISCOVER_MARKETS")
         || env_flag("RITHMIC_DISCOVER_INSTRUMENTS");
     let discover_instruments = env_flag("RITHMIC_DISCOVER_INSTRUMENTS");
@@ -373,11 +377,6 @@ pub async fn run_connection_probe(
         .diagnostic_log_dir
         .clone()
         .unwrap_or_else(|| "target/rithmic-diagnostics".to_string());
-    let mbo_depth_price = std::env::var("RITHMIC_MBO_DEPTH_PRICE")
-        .ok()
-        .map(|value| value.parse::<f64>())
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("Invalid RITHMIC_MBO_DEPTH_PRICE: {e}"))?;
     let discovered_catalog = if discover_markets {
         Some(
             tokio::time::timeout(
@@ -466,7 +465,7 @@ pub async fn run_connection_probe(
                 task_cancel,
                 Some(task_raw_book_metrics),
                 mbo_probe_enabled,
-                mbo_depth_price,
+                None,
             )
             .await
     });
@@ -731,7 +730,10 @@ fn subscriptions(config: &RithmicDataClientConfig) -> anyhow::Result<Vec<MarketS
     if config.subscribe_book_deltas {
         bits |= update_bits::ORDER_BOOK;
     }
-    anyhow::ensure!(bits != 0, "At least one Rithmic market-data type must be enabled");
+    anyhow::ensure!(
+        bits != 0 || config.subscribe_mbo,
+        "At least one Rithmic market-data type must be enabled"
+    );
 
     config
         .market_subscriptions

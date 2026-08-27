@@ -582,7 +582,9 @@ impl RithmicSession {
                 let subscription = session
                     .resolve_subscription(subscription, front_month_fallback)
                     .await?;
-                session.subscribe(&subscription).await?;
+                if subscription.update_bits != 0 {
+                    session.subscribe(&subscription).await?;
+                }
                 resolved.push(subscription);
             }
             Ok((session, resolved))
@@ -1159,7 +1161,8 @@ impl RithmicSession {
             LivenessWatchdog::new("WebSocket ping", WEBSOCKET_PING_TIMEOUT);
         let mut book_sequence = 0_u64;
         let mut quote_cache = HashMap::<InstrumentId, QuoteState>::new();
-        let mut depth_by_order_requests = HashMap::<InstrumentId, (MarketSubscription, f64)>::new();
+        let mut depth_by_order_requests =
+            HashMap::<InstrumentId, (MarketSubscription, Option<f64>)>::new();
         let mut mbo_order_ids = HashMap::<u64, String>::new();
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         websocket_ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1172,19 +1175,22 @@ impl RithmicSession {
                     depth_price.is_finite() && depth_price > 0.0,
                     "Rithmic depth-by-order probe price must be positive"
                 );
-                for subscription in &subscriptions {
-                    self.request_depth_by_order(subscription, depth_price).await?;
-                    let instrument_id = InstrumentId::from(
-                        format!("{}.{}", subscription.symbol, subscription.exchange).as_str(),
-                    );
-                    depth_by_order_requests
-                        .insert(instrument_id, (subscription.clone(), depth_price));
-                }
                 if let Some(metrics) = &raw_book_metrics {
                     metrics
                         .mbo_selected_price_bits
                         .store(depth_price.to_bits(), Ordering::Relaxed);
                 }
+            }
+            for subscription in &subscriptions {
+                self.request_depth_by_order(subscription, depth_by_order_price)
+                    .await?;
+                let instrument_id = InstrumentId::from(
+                    format!("{}.{}", subscription.symbol, subscription.exchange).as_str(),
+                );
+                depth_by_order_requests.insert(
+                    instrument_id,
+                    (subscription.clone(), depth_by_order_price),
+                );
             }
         }
 
@@ -1240,7 +1246,9 @@ impl RithmicSession {
         }
 
         for subscription in &subscriptions {
-            self.unsubscribe(subscription).await?;
+            if subscription.update_bits != 0 {
+                self.unsubscribe(subscription).await?;
+            }
         }
         for (_, (subscription, depth_price)) in depth_by_order_requests {
             self.unsubscribe_depth_by_order(&subscription, depth_price)
@@ -1267,7 +1275,7 @@ impl RithmicSession {
         configured_depth_price: Option<f64>,
         depth_by_order_requests: &mut HashMap<
             InstrumentId,
-            (MarketSubscription, f64),
+            (MarketSubscription, Option<f64>),
         >,
         mbo_order_ids: &mut HashMap<u64, String>,
         heartbeat_watchdog: &mut LivenessWatchdog,
@@ -1336,28 +1344,23 @@ impl RithmicSession {
                     }
                     if probe_depth_by_order && !depth_by_order_requests.contains_key(&instrument_id)
                     {
-                        let depth_price = configured_depth_price.or_else(|| {
-                            (update.bid_price.is_finite() && update.bid_price > 0.0)
-                                .then_some(update.bid_price)
-                                .or_else(|| {
-                                    (update.ask_price.is_finite() && update.ask_price > 0.0)
-                                        .then_some(update.ask_price)
-                                })
-                        });
-                        if let Some(depth_price) = depth_price {
-                            let subscription = MarketSubscription::new(
-                                update.symbol.clone(),
-                                update.exchange.clone(),
-                                0,
-                            );
-                            self.request_depth_by_order(&subscription, depth_price).await?;
-                            depth_by_order_requests
-                                .insert(instrument_id, (subscription, depth_price));
-                            if let Some(metrics) = raw_book_metrics {
-                                metrics
-                                    .mbo_selected_price_bits
-                                    .store(depth_price.to_bits(), Ordering::Relaxed);
-                            }
+                        let subscription = MarketSubscription::new(
+                            update.symbol.clone(),
+                            update.exchange.clone(),
+                            0,
+                        );
+                        self.request_depth_by_order(&subscription, configured_depth_price)
+                            .await?;
+                        depth_by_order_requests.insert(
+                            instrument_id,
+                            (subscription, configured_depth_price),
+                        );
+                        if let (Some(metrics), Some(depth_price)) =
+                            (raw_book_metrics, configured_depth_price)
+                        {
+                            metrics
+                                .mbo_selected_price_bits
+                                .store(depth_price.to_bits(), Ordering::Relaxed);
                         }
                     }
                 }
@@ -1493,7 +1496,7 @@ impl RithmicSession {
     async fn request_depth_by_order(
         &mut self,
         subscription: &MarketSubscription,
-        depth_price: f64,
+        depth_price: Option<f64>,
     ) -> anyhow::Result<()> {
         let snapshot = RequestDepthByOrderSnapshot {
             template_id: DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID,
@@ -1514,11 +1517,18 @@ impl RithmicSession {
             ..Default::default()
         };
         Self::send_protobuf(&mut self.socket, &updates).await?;
-        log::info!(
-            "Requested Rithmic depth by order for {}.{} at {depth_price}",
-            subscription.exchange,
-            subscription.symbol
-        );
+        match depth_price {
+            Some(depth_price) => log::info!(
+                "Requested Rithmic depth by order for {}.{} at {depth_price}",
+                subscription.exchange,
+                subscription.symbol
+            ),
+            None => log::info!(
+                "Requested full Rithmic depth by order for {}.{}",
+                subscription.exchange,
+                subscription.symbol
+            ),
+        }
         Ok(())
     }
 
@@ -1561,7 +1571,7 @@ impl RithmicSession {
     async fn unsubscribe_depth_by_order(
         &mut self,
         subscription: &MarketSubscription,
-        depth_price: f64,
+        depth_price: Option<f64>,
     ) -> anyhow::Result<()> {
         let request = RequestDepthByOrderUpdates {
             template_id: DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID,

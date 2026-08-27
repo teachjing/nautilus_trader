@@ -99,6 +99,10 @@ impl RithmicDataClient {
             config.reconnect_delay_initial_secs <= config.reconnect_delay_max_secs,
             "Rithmic initial reconnect delay cannot exceed maximum delay"
         );
+        anyhow::ensure!(
+            !(config.subscribe_book_deltas && config.subscribe_mbo),
+            "Rithmic L2 market-by-price and L3 market-by-order subscriptions are mutually exclusive"
+        );
 
         let (history_sender, history_receiver) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
@@ -141,6 +145,10 @@ impl RithmicDataClient {
     }
 
     fn subscriptions(&self) -> anyhow::Result<Vec<MarketSubscription>> {
+        anyhow::ensure!(
+            !(self.config.subscribe_book_deltas && self.config.subscribe_mbo),
+            "Rithmic L2 market-by-price and L3 market-by-order subscriptions are mutually exclusive"
+        );
         let mut bits = 0;
         if self.config.subscribe_trades {
             bits |= update_bits::LAST_TRADE;
@@ -151,7 +159,10 @@ impl RithmicDataClient {
         if self.config.subscribe_book_deltas {
             bits |= update_bits::ORDER_BOOK;
         }
-        anyhow::ensure!(bits != 0, "At least one Rithmic market-data type must be enabled");
+        anyhow::ensure!(
+            bits != 0 || self.config.subscribe_mbo,
+            "At least one Rithmic market-data type must be enabled"
+        );
 
         self.config
             .market_subscriptions
@@ -340,6 +351,7 @@ impl DataClient for RithmicDataClient {
         let connect_timeout = Duration::from_secs(self.config.connect_timeout_secs);
         let initial_delay = Duration::from_secs(self.config.reconnect_delay_initial_secs);
         let maximum_delay = Duration::from_secs(self.config.reconnect_delay_max_secs);
+        let subscribe_mbo = self.config.subscribe_mbo;
         let (session, resolved_subscriptions) = RithmicSession::connect_subscribed(
             &gateway_url,
             &credentials,
@@ -393,7 +405,7 @@ impl DataClient for RithmicDataClient {
                         clock,
                         cancel.clone(),
                         None,
-                        false,
+                        subscribe_mbo,
                         None,
                     )
                     .await;
@@ -573,6 +585,21 @@ mod tests {
     #[case("CME.MES.U6")]
     fn rejects_invalid_subscription(#[case] value: &str) {
         assert!(parse_subscription(value, update_bits::LAST_TRADE).is_err());
+    }
+
+    #[rstest]
+    fn rejects_mixed_mbp_and_mbo_configuration() {
+        let config = RithmicDataClientConfig {
+            username: Some("user".to_string()),
+            password: Some("password".to_string()),
+            subscribe_book_deltas: true,
+            subscribe_mbo: true,
+            ..Default::default()
+        };
+
+        let error = RithmicDataClient::new(ClientId::from("RITHMIC"), config).unwrap_err();
+
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 
     #[rstest]

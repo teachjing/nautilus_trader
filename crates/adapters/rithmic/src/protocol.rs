@@ -482,8 +482,8 @@ pub struct RequestDepthByOrderSnapshot {
     pub symbol: String,
     #[prost(string, tag = "110101")]
     pub exchange: String,
-    #[prost(double, tag = "154405")]
-    pub depth_price: f64,
+    #[prost(double, optional, tag = "154405")]
+    pub depth_price: Option<f64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -504,8 +504,8 @@ pub struct ResponseDepthByOrderSnapshot {
     pub sequence_number: u64,
     #[prost(enumeration = "DepthTransactionType", tag = "153612")]
     pub depth_side: i32,
-    #[prost(double, tag = "154405")]
-    pub depth_price: f64,
+    #[prost(double, optional, tag = "154405")]
+    pub depth_price: Option<f64>,
     #[prost(int32, repeated, tag = "154406")]
     pub depth_size: Vec<i32>,
     #[prost(uint64, repeated, tag = "153613")]
@@ -526,8 +526,8 @@ pub struct RequestDepthByOrderUpdates {
     pub symbol: String,
     #[prost(string, tag = "110101")]
     pub exchange: String,
-    #[prost(double, tag = "154405")]
-    pub depth_price: f64,
+    #[prost(double, optional, tag = "154405")]
+    pub depth_price: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -903,6 +903,24 @@ mod tests {
         };
         assert_eq!(decoded.symbol, "MESU6");
         assert_eq!(decoded.ask_price, 6_000.25);
+    }
+
+    #[rstest]
+    fn depth_by_order_request_can_omit_price_for_full_mbo() {
+        let request = RequestDepthByOrderUpdates {
+            template_id: DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID,
+            user_msg: vec!["mbo".to_string()],
+            request: SubscriptionRequest::Subscribe as i32,
+            symbol: "MESU6".to_string(),
+            exchange: "CME".to_string(),
+            depth_price: None,
+        };
+
+        let decoded = RequestDepthByOrderUpdates::decode(request.encode_to_vec().as_slice())
+            .expect("full MBO request should decode");
+
+        assert_eq!(decoded.user_msg, vec!["mbo"]);
+        assert!(decoded.depth_price.is_none());
     }
 
     #[rstest]

@@ -33,19 +33,25 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(30);
+    let require_mbo = std::env::var("RITHMIC_REQUIRE_MBO").is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    });
+    let test_mbo = std::env::var("RITHMIC_TEST_MBO").is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    });
+    let subscribe_mbo = require_mbo || test_mbo;
     let config = RithmicDataClientConfig {
         system_name,
         gateway_url,
         market_subscriptions: vec![subscription],
         front_month_fallback: Some(fallback),
         diagnostic_log_dir: Some(diagnostic_log_dir),
+        subscribe_book_deltas: !subscribe_mbo,
+        subscribe_mbo,
         ..Default::default()
     };
     let expected_system_name = config.system_name.clone();
     let require_book_data = std::env::var("RITHMIC_REQUIRE_BOOK_DATA").is_ok_and(|value| {
-        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
-    });
-    let require_mbo = std::env::var("RITHMIC_REQUIRE_MBO").is_ok_and(|value| {
         matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
     });
     let discover_markets = std::env::var("RITHMIC_DISCOVER_MARKETS").is_ok_and(|value| {

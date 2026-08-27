@@ -43,6 +43,12 @@ pub struct RithmicDataClientConfig {
     /// Request market-by-price order-book updates.
     #[builder(default = true)]
     pub subscribe_book_deltas: bool,
+    /// Request full-depth market-by-order updates with exchange order IDs.
+    ///
+    /// This is mutually exclusive with `subscribe_book_deltas` because Nautilus books must not
+    /// mix L2 market-by-price and L3 market-by-order deltas.
+    #[builder(default)]
+    pub subscribe_mbo: bool,
     /// Request best-bid/offer updates.
     #[builder(default = true)]
     pub subscribe_quotes: bool,
@@ -72,6 +78,7 @@ impl Debug for RithmicDataClientConfig {
             .field("diagnostic_log_dir", &self.diagnostic_log_dir)
             .field("rollover_days", &self.rollover_days)
             .field("subscribe_book_deltas", &self.subscribe_book_deltas)
+            .field("subscribe_mbo", &self.subscribe_mbo)
             .field("subscribe_quotes", &self.subscribe_quotes)
             .field("subscribe_trades", &self.subscribe_trades)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
@@ -105,6 +112,7 @@ nautilus_core::impl_pyo3_config_getters!(RithmicDataClientConfig {
     diagnostic_log_dir: Option<String>,
     rollover_days: u16,
     subscribe_book_deltas: bool,
+    subscribe_mbo: bool,
     subscribe_quotes: bool,
     subscribe_trades: bool,
     connect_timeout_secs: u64,
@@ -126,6 +134,7 @@ mod tests {
         assert!(config.diagnostic_log_dir.is_none());
         assert_eq!(config.rollover_days, 7);
         assert!(config.subscribe_book_deltas);
+        assert!(!config.subscribe_mbo);
         assert!(config.subscribe_quotes);
         assert!(config.subscribe_trades);
         assert_eq!(config.connect_timeout_secs, 30);

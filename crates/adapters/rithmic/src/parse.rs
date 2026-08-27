@@ -289,7 +289,10 @@ pub fn parse_depth_by_order_snapshot(
             || response.depth_order_priority.len() == response.depth_size.len(),
         "Rithmic MBO snapshot priority array length differs"
     );
-    validate_price(response.depth_price, "MBO snapshot price")?;
+    let depth_price = response
+        .depth_price
+        .ok_or_else(|| anyhow::anyhow!("Rithmic MBO snapshot has no depth price"))?;
+    validate_price(depth_price, "MBO snapshot price")?;
     let side = depth_side(response.depth_side)?;
     let instrument_id = instrument_id(&response.symbol, &response.exchange)?;
     let mut deltas = Vec::with_capacity(response.depth_size.len());
@@ -300,7 +303,7 @@ pub fn parse_depth_by_order_snapshot(
             BookAction::Add,
             BookOrder::new(
                 side,
-                price(response.depth_price),
+                price(depth_price),
                 Quantity::new(size as f64, 0),
                 mbo_order_id(exchange_order_id)?,
             ),
@@ -624,7 +627,7 @@ mod tests {
             exchange: "CME".to_string(),
             sequence_number: 42,
             depth_side: DepthTransactionType::Buy as i32,
-            depth_price: 6_000.25,
+            depth_price: Some(6_000.25),
             depth_size: vec![3, 5],
             exchange_order_id: vec!["order-a".to_string(), "order-b".to_string()],
             rp_code: vec!["0".to_string()],

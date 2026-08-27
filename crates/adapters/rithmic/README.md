@@ -14,7 +14,7 @@ a socket authenticated to another plant.
 | Plant | Implemented use | Templates |
 |---|---|---|
 | Shared discovery | Available Rithmic systems | 16/17 |
-| Ticker Plant | Symbol search, front month, trades, BBO, MBP and price-specific MBO | 109/110, 113/114, 100/101, 115-118, 150/151/156, 160/161 |
+| Ticker Plant | Symbol search, front month, trades, BBO, MBP and full-depth MBO | 109/110, 113/114, 100/101, 115-118, 150/151/156, 160/161 |
 | Order Plant | Exchange and market-data entitlement discovery | 342/343 |
 | History Plant | Historical time-bar replay | 202/203 |
 
@@ -33,7 +33,7 @@ the current Rithmic adapter can populate and which Rithmic templates provide the
 | `TradeTick` | Implemented | Template 150 last trade: price, size, aggressor, exchange trade/order identity and source timestamp. |
 | `QuoteTick` | Implemented | Template 151 BBO. Partial bid/ask updates are combined with cached state and normalized to equal precision. |
 | `OrderBookDelta` / `OrderBookDeltas` (`L2_MBP`) | Implemented | Template 156 full-depth market-by-price snapshots and incremental price-level updates. |
-| `OrderBookDelta` / `OrderBookDeltas` (`L3_MBO`) | Implemented for requested prices | Templates 115-118 and 160/161 expose exchange order IDs, queue priority, new/change/delete events and previous price. Rithmic depth-by-order requests are price-specific; this is not yet a complete all-price L3 book. |
+| `OrderBookDelta` / `OrderBookDeltas` (`L3_MBO`) | Implemented | Templates 115-118 and 160/161 expose exchange order IDs, queue priority, new/change/delete events and previous price. The adapter omits the optional `depth_price` request field to receive all available orders. |
 | `OrderBookDepth10` | Derivable, not emitted | The first ten bid/ask levels can be projected from template 156, but the adapter currently emits deltas so Nautilus maintains the book. |
 | `Bar` | Implemented for historical time bars | History Plant templates 202/203 map OHLCV and marker time to an external Nautilus `Bar`. Second, minute, daily and weekly families are supported. |
 | Nautilus instrument definitions | Partial discovery only | Templates 109/110 produce a queryable symbol catalog. Full `FuturesContract` creation still needs reference data such as tick size, currency, multiplier and expiration semantics. |
@@ -86,6 +86,11 @@ cargo test -p nautilus-rithmic \
   --features live-tests \
   -- --ignored --nocapture
 ```
+
+MBO and MBP are deliberately separate feed modes. For an MBO client, configure
+`subscribe_book_deltas=false` and `subscribe_mbo=true`. The adapter rejects enabling both because
+L2 price-level deltas and L3 order-level deltas cannot safely populate the same Nautilus book.
+MBO requests omit `depth_price`; no BBO-derived price filter is applied.
 
 The stable discovery catalog is written to
 `target/rithmic-diagnostics/rithmic-discovery.json`. Query it with:
