@@ -462,24 +462,24 @@ impl RithmicSession {
             session.logout_and_close().await?;
         }
 
-        if !result.history_with_ticker_and_order_connected
-            && !result.history_with_ticker_only_connected
+        // Always test the ticker + history combination independently. When the
+        // three-plant attempt succeeds, skipping this step leaves the default
+        // `false` value looking like a rejected connection rather than an
+        // untested scenario.
+        match Self::connect_without_discovery(
+            gateway_url,
+            credentials,
+            diagnostic_log,
+            InfrastructureType::HistoryPlant,
+            available_systems,
+        )
+        .await
         {
-            match Self::connect_without_discovery(
-                gateway_url,
-                credentials,
-                diagnostic_log,
-                InfrastructureType::HistoryPlant,
-                available_systems,
-            )
-            .await
-            {
-                Ok(mut session) => {
-                    result.history_with_ticker_only_connected = true;
-                    session.logout_and_close().await?;
-                }
-                Err(error) => result.history_ticker_only_error = Some(format!("{error:#}")),
+            Ok(mut session) => {
+                result.history_with_ticker_only_connected = true;
+                session.logout_and_close().await?;
             }
+            Err(error) => result.history_ticker_only_error = Some(format!("{error:#}")),
         }
         ticker.logout_and_close().await?;
         Ok(result)
