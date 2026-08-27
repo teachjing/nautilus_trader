@@ -68,6 +68,7 @@ pub fn parse_trade(update: &LastTrade, ts_init: UnixNanos) -> anyhow::Result<Tra
 pub struct QuoteState {
     bid: Option<(Price, Quantity)>,
     ask: Option<(Price, Quantity)>,
+    price_precision: u8,
 }
 
 /// Applies a Rithmic BBO update and returns a quote once both sides are available.
@@ -93,6 +94,9 @@ pub fn parse_quote(
     if update.presence_bits & quote_presence_bits::BID != 0 {
         validate_price(update.bid_price, "bid price")?;
         anyhow::ensure!(update.bid_size >= 0, "Rithmic bid size cannot be negative");
+        state.price_precision = state
+            .price_precision
+            .max(decimal_precision(update.bid_price));
         state.bid = Some((
             price(update.bid_price),
             Quantity::new(update.bid_size as f64, 0),
@@ -101,6 +105,9 @@ pub fn parse_quote(
     if update.presence_bits & quote_presence_bits::ASK != 0 {
         validate_price(update.ask_price, "ask price")?;
         anyhow::ensure!(update.ask_size >= 0, "Rithmic ask size cannot be negative");
+        state.price_precision = state
+            .price_precision
+            .max(decimal_precision(update.ask_price));
         state.ask = Some((
             price(update.ask_price),
             Quantity::new(update.ask_size as f64, 0),
@@ -109,6 +116,10 @@ pub fn parse_quote(
     let (Some((bid_price, bid_size)), Some((ask_price, ask_size))) = (state.bid, state.ask) else {
         return Ok(None);
     };
+    let bid_price = Price::new(bid_price.as_f64(), state.price_precision);
+    let ask_price = Price::new(ask_price.as_f64(), state.price_precision);
+    state.bid = Some((bid_price, bid_size));
+    state.ask = Some((ask_price, ask_size));
 
     Ok(Some(QuoteTick::new_checked(
         instrument_id(&update.symbol, &update.exchange)?,
@@ -365,8 +376,10 @@ mod tests {
         let quote = parse_quote(&update, &mut QuoteState::default(), TS_INIT)
             .unwrap()
             .unwrap();
-        assert_eq!(quote.bid_price, Price::from("6000"));
+        assert_eq!(quote.bid_price, Price::from("6000.00"));
         assert_eq!(quote.ask_price, Price::from("6000.25"));
+        assert_eq!(quote.bid_price.precision, 2);
+        assert_eq!(quote.ask_price.precision, 2);
         assert_eq!(quote.bid_size, Quantity::from(12));
         assert_eq!(quote.ask_size, Quantity::from(9));
     }
@@ -444,5 +457,6 @@ mod tests {
         assert_eq!(updated.bid_price, Price::from("6000.25"));
         assert_eq!(updated.ask_price, first.ask_price);
         assert_eq!(updated.ask_size, first.ask_size);
+        assert_eq!(updated.bid_price.precision, updated.ask_price.precision);
     }
 }
