@@ -40,6 +40,11 @@ async fn validates_history_plant_time_bar_replay() {
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(1);
+    let bar_type = RithmicHistoricalBarType::parse(
+        &std::env::var("RITHMIC_HISTORICAL_BAR_TYPE")
+            .unwrap_or_else(|_| "minute".to_string()),
+    )
+    .expect("RITHMIC_HISTORICAL_BAR_TYPE is invalid");
     let max_pages = std::env::var("RITHMIC_HISTORICAL_MAX_PAGES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -59,7 +64,7 @@ async fn validates_history_plant_time_bar_replay() {
         config,
         exchange,
         symbol,
-        RithmicHistoricalBarType::Minute,
+        bar_type,
         period,
         finish.saturating_sub(lookback_secs),
         finish,
@@ -69,14 +74,17 @@ async fn validates_history_plant_time_bar_replay() {
     .expect("Rithmic historical time-bar probe failed");
 
     println!(
-        "Rithmic historical result: instrument={}, bars={}, pages={}, first={:?}, last={:?}",
+        "Rithmic historical result: instrument={}, bars={}, pages={}, first={:?}, last={:?}, output={}",
         result.instrument,
         result.bars.len(),
         result.pages,
         result.first_timestamp,
         result.last_timestamp,
+        result.output_path,
     );
     assert!(!result.available_systems.is_empty());
     assert!(!result.bars.is_empty(), "History Plant returned no bars for the requested range");
+    assert_eq!(result.records.len(), result.bars.len());
+    assert!(std::path::Path::new(&result.output_path).exists());
     assert!(result.bars.windows(2).all(|pair| pair[0].ts_event < pair[1].ts_event));
 }

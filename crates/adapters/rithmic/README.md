@@ -159,6 +159,7 @@ Use an explicit contract for the historical probe:
 ```bash
 export RITHMIC_HISTORICAL_SUBSCRIPTION="CME.ESU6"
 export RITHMIC_HISTORICAL_LOOKBACK_SECS="86400"
+export RITHMIC_HISTORICAL_BAR_TYPE="minute"
 export RITHMIC_HISTORICAL_BAR_PERIOD="1"
 export RITHMIC_HISTORICAL_MAX_PAGES="10"
 
@@ -170,6 +171,10 @@ cargo test -p nautilus-rithmic \
 
 The test validates system discovery, History Plant login, replay response codes, pagination,
 strictly increasing timestamps, OHLC correctness, native `Bar` conversion, and orderly logout.
+It also writes JSON-safe OHLCV records to a path such as
+`target/rithmic-diagnostics/rithmic-historical-CME-ESU6-minute-1.json`. Supported interval families
+are `second`, `minute`, `daily`, and `weekly`; `RITHMIC_HISTORICAL_BAR_PERIOD` supplies the interval
+multiple.
 
 ## Remaining adapter work
 

@@ -41,6 +41,32 @@ impl RithmicHistoricalBarType {
             Self::Weekly => "WEEK",
         }
     }
+
+    /// Parses a UI/config interval family name.
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "second" | "seconds" => Ok(Self::Second),
+            "minute" | "minutes" => Ok(Self::Minute),
+            "day" | "daily" => Ok(Self::Daily),
+            "week" | "weekly" => Ok(Self::Weekly),
+            _ => anyhow::bail!(
+                "Unsupported Rithmic historical bar type '{value}'; expected second, minute, daily, or weekly"
+            ),
+        }
+    }
+}
+
+/// JSON-safe historical bar returned for inspection and UI transport.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RithmicHistoricalBarRecord {
+    pub bar_type: String,
+    pub open: String,
+    pub high: String,
+    pub low: String,
+    pub close: String,
+    pub volume: String,
+    pub ts_event: u64,
+    pub ts_init: u64,
 }
 
 /// Result of one credential-gated History Plant time-bar replay probe.
@@ -49,6 +75,8 @@ pub struct RithmicHistoricalBarProbeResult {
     pub available_systems: Vec<String>,
     pub instrument: String,
     pub bars: Vec<Bar>,
+    pub records: Vec<RithmicHistoricalBarRecord>,
+    pub output_path: String,
     pub pages: usize,
     pub first_timestamp: Option<UnixNanos>,
     pub last_timestamp: Option<UnixNanos>,
@@ -106,10 +134,37 @@ pub async fn run_historical_time_bar_probe(
     session.logout_and_close().await?;
     let first_timestamp = bars.first().map(|bar| bar.ts_event);
     let last_timestamp = bars.last().map(|bar| bar.ts_event);
+    let records = bars
+        .iter()
+        .map(|bar| RithmicHistoricalBarRecord {
+            bar_type: bar.bar_type.to_string(),
+            open: bar.open.to_string(),
+            high: bar.high.to_string(),
+            low: bar.low.to_string(),
+            close: bar.close.to_string(),
+            volume: bar.volume.to_string(),
+            ts_event: bar.ts_event.as_u64(),
+            ts_init: bar.ts_init.as_u64(),
+        })
+        .collect::<Vec<_>>();
+    let output_dir = config
+        .diagnostic_log_dir
+        .as_deref()
+        .unwrap_or("target/rithmic-diagnostics");
+    let output_path = std::path::Path::new(output_dir).join(format!(
+        "rithmic-historical-{exchange}-{symbol}-{}-{period}.json",
+        bar_type.nautilus_name().to_ascii_lowercase(),
+    ));
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&output_path, serde_json::to_vec_pretty(&records)?)?;
     Ok(RithmicHistoricalBarProbeResult {
         available_systems,
         instrument: format!("{symbol}.{exchange}"),
         bars,
+        records,
+        output_path: output_path.display().to_string(),
         pages,
         first_timestamp,
         last_timestamp,
@@ -211,5 +266,17 @@ mod tests {
         assert_eq!(bar.bar_type.to_string(), "ESU6.CME-1-MINUTE-LAST-EXTERNAL");
         assert_eq!(bar.volume, Quantity::from(123));
         assert_eq!(bar.open.precision, bar.close.precision);
+    }
+
+    #[rstest]
+    #[case("second", RithmicHistoricalBarType::Second)]
+    #[case("MINUTE", RithmicHistoricalBarType::Minute)]
+    #[case("daily", RithmicHistoricalBarType::Daily)]
+    #[case("weekly", RithmicHistoricalBarType::Weekly)]
+    fn parses_historical_bar_type(
+        #[case] value: &str,
+        #[case] expected: RithmicHistoricalBarType,
+    ) {
+        assert_eq!(RithmicHistoricalBarType::parse(value).unwrap(), expected);
     }
 }
