@@ -90,6 +90,8 @@ impl RithmicSession {
         gateway_url: &str,
         credentials: &LoginCredentials,
     ) -> anyhow::Result<Self> {
+        nautilus_cryptography::providers::install_cryptographic_provider();
+
         let systems = Self::discover_systems(gateway_url).await?;
         anyhow::ensure!(
             systems.system_name.iter().any(|name| name == &credentials.system_name),
