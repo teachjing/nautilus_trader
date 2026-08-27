@@ -22,7 +22,7 @@ use std::{
 };
 
 use anyhow::Context;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use nautilus_common::messages::DataEvent;
 use nautilus_core::time::AtomicTime;
 use nautilus_model::{data::Data, identifiers::InstrumentId};
