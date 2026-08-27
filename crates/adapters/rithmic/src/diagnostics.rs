@@ -211,6 +211,26 @@ pub async fn run_connection_probe(
     let discover_markets = env_flag("RITHMIC_DISCOVER_MARKETS")
         || env_flag("RITHMIC_DISCOVER_INSTRUMENTS");
     let discover_instruments = env_flag("RITHMIC_DISCOVER_INSTRUMENTS");
+    let discovery_exchanges = std::env::var("RITHMIC_DISCOVERY_EXCHANGES")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_uppercase)
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| {
+            let mut exchanges = subscriptions
+                .iter()
+                .map(|subscription| subscription.exchange.to_ascii_uppercase())
+                .collect::<Vec<_>>();
+            exchanges.sort();
+            exchanges.dedup();
+            exchanges
+        });
     let plant_capacity_probe_enabled = env_flag("RITHMIC_TEST_PLANT_CAPACITY");
     let discovery_timeout_secs = std::env::var("RITHMIC_DISCOVERY_TIMEOUT_SECS")
         .ok()
@@ -235,6 +255,7 @@ pub async fn run_connection_probe(
                     &config.gateway_url,
                     &credentials,
                     discover_instruments,
+                    &discovery_exchanges,
                     config.diagnostic_log_dir.as_deref(),
                 ),
             )

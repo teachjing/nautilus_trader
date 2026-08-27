@@ -690,6 +690,7 @@ impl RithmicSession {
         gateway_url: &str,
         credentials: &LoginCredentials,
         include_instruments: bool,
+        instrument_exchanges: &[String],
         diagnostic_log_dir: Option<&str>,
     ) -> anyhow::Result<RithmicDiscoveryCatalog> {
         let diagnostic_log = DiagnosticLog::create(diagnostic_log_dir)?;
@@ -737,6 +738,11 @@ impl RithmicSession {
                 .exchanges
                 .iter()
                 .filter(|exchange| exchange.entitled)
+                .filter(|exchange| {
+                    instrument_exchanges
+                        .iter()
+                        .any(|selected| selected.eq_ignore_ascii_case(&exchange.exchange))
+                })
                 .map(|exchange| exchange.exchange.clone())
                 .collect::<Vec<_>>();
             for exchange in exchanges {
@@ -767,6 +773,7 @@ impl RithmicSession {
                     "entitled_exchanges": catalog.exchanges.iter().filter(|value| value.entitled).count(),
                     "instruments": catalog.instruments.len(),
                     "instrument_search_enabled": include_instruments,
+                    "instrument_exchanges": instrument_exchanges,
                 }),
             );
         }

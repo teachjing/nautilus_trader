@@ -72,6 +72,7 @@ export RITHMIC_DIAGNOSTIC_LOG_DIR="target/rithmic-diagnostics"
 
 export RITHMIC_DISCOVER_MARKETS="true"
 export RITHMIC_DISCOVER_INSTRUMENTS="true"
+export RITHMIC_DISCOVERY_EXCHANGES="CME"
 export RITHMIC_DISCOVERY_TIMEOUT_SECS="300"
 
 export RITHMIC_TEST_MBO="true"
@@ -88,6 +89,11 @@ cargo test -p nautilus-rithmic \
 
 The stable discovery catalog is written to
 `target/rithmic-diagnostics/rithmic-discovery.json`. Query it with:
+
+Exchange permissions are always collected for every market returned by Rithmic. Instrument
+enumeration is limited to `RITHMIC_DISCOVERY_EXCHANGES` (a comma-separated list) so a normal live
+probe does not attempt an unbounded global contract crawl. When the variable is unset, the adapter
+uses the exchanges from `RITHMIC_LIVE_SUBSCRIPTION(S)`.
 
 ```bash
 cargo run -p nautilus-rithmic --example catalog_query -- \
