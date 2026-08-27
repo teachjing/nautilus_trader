@@ -205,3 +205,14 @@ become HTTP query parameters or expand Nautilus's generic historical request sur
 - Add tick replay templates 206/207 and conversion to historical `TradeTick` data.
 - Validate and map Market Mode (157), End Of Day Prices (155), and Indicator Prices (154).
 - Decide which Rithmic-only statistics should become registered `CustomData` schemas.
+
+## What rithmic provides
+- Rithmic’s fee for the market depth market data bundle (all 4 CME Group exchanges)
+- Rithmic’s monthly fees for access to market data from Nasdaq
+
+## Make sure
+- methods can be passed a JSON object to map parameters to the request for search for example I can pass PRODUCT_CODE or SEARCH and result is depending on what returns
+- The API mapper will treat options as an opaque adapter property bag. Only the Rithmic adapter interprets those values; they will not become HTTP query parameters or leak into Nautilus’s generic request shape.
+- Top level: portable request fields and generic metadata.
+- options: Rithmic-only behavior.
+- Unknown options entries are retained for future adapter features without changing the endpoint contract.
