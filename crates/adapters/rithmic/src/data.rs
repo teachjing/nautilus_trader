@@ -193,6 +193,8 @@ impl DataClient for RithmicDataClient {
         let credentials = self.credentials()?;
         let subscriptions = self.subscriptions()?;
         let gateway_url = self.config.gateway_url.clone();
+        let front_month_fallback = self.config.front_month_fallback.clone();
+        let diagnostic_log_dir = self.config.diagnostic_log_dir.clone();
         let connect_timeout = Duration::from_secs(self.config.connect_timeout_secs);
         let initial_delay = Duration::from_secs(self.config.reconnect_delay_initial_secs);
         let maximum_delay = Duration::from_secs(self.config.reconnect_delay_max_secs);
@@ -201,6 +203,8 @@ impl DataClient for RithmicDataClient {
             &credentials,
             &subscriptions,
             connect_timeout,
+            front_month_fallback.as_deref(),
+            diagnostic_log_dir.as_deref(),
         )
         .await?;
 
@@ -253,6 +257,8 @@ impl DataClient for RithmicDataClient {
                         &credentials,
                         &subscriptions,
                         connect_timeout,
+                        front_month_fallback.as_deref(),
+                        diagnostic_log_dir.as_deref(),
                     )
                     .await
                     {

@@ -28,6 +28,10 @@ async fn main() -> anyhow::Result<()> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect();
+    let fallback = std::env::var("RITHMIC_LIVE_FALLBACK_SUBSCRIPTION")
+        .unwrap_or_else(|_| "CME.MESU6".to_string());
+    let diagnostic_log_dir = std::env::var("RITHMIC_DIAGNOSTIC_LOG_DIR")
+        .unwrap_or_else(|_| "target/rithmic-diagnostics".to_string());
     let duration_secs = std::env::var("RITHMIC_LIVE_DURATION_SECS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -36,6 +40,8 @@ async fn main() -> anyhow::Result<()> {
         system_name,
         gateway_url,
         market_subscriptions: subscriptions,
+        front_month_fallback: Some(fallback),
+        diagnostic_log_dir: Some(diagnostic_log_dir),
         ..Default::default()
     };
 

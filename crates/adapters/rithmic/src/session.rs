@@ -8,8 +8,17 @@
 
 //! Rithmic ticker-plant WebSocket session.
 
-use std::{collections::HashMap, fmt::Debug, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    fs::{create_dir_all, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
+use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use nautilus_common::messages::DataEvent;
 use nautilus_core::time::AtomicTime;
@@ -75,6 +84,44 @@ impl ReconnectBackoff {
 pub(crate) struct RithmicSession {
     socket: RithmicWebSocket,
     heartbeat_interval: Duration,
+    available_systems: Vec<String>,
+    diagnostic_log: Option<Arc<DiagnosticLog>>,
+}
+
+#[derive(Debug)]
+struct DiagnosticLog {
+    path: PathBuf,
+}
+
+impl DiagnosticLog {
+    fn create(directory: Option<&str>) -> anyhow::Result<Option<Arc<Self>>> {
+        let Some(directory) = directory else {
+            return Ok(None);
+        };
+        create_dir_all(directory)?;
+        let epoch = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let path = Path::new(directory).join(format!("rithmic-live-{epoch}.jsonl"));
+        let log = Arc::new(Self { path });
+        log.record("diagnostic_log", "created", serde_json::json!({}));
+        log::info!("Writing Rithmic diagnostics to {}", log.path.display());
+        Ok(Some(log))
+    }
+
+    fn record(&self, stage: &str, status: &str, details: serde_json::Value) {
+        let record = serde_json::json!({
+            "stage": stage,
+            "status": status,
+            "details": details,
+        });
+        let result = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .and_then(|mut file| writeln!(file, "{record}"));
+        if let Err(e) = result {
+            log::warn!("Failed to write Rithmic diagnostic log: {e}");
+        }
+    }
 }
 
 impl Debug for RithmicSession {
@@ -89,10 +136,13 @@ impl RithmicSession {
     async fn connect_inner(
         gateway_url: &str,
         credentials: &LoginCredentials,
+        diagnostic_log: Option<Arc<DiagnosticLog>>,
     ) -> anyhow::Result<Self> {
         nautilus_cryptography::providers::install_cryptographic_provider();
 
-        let systems = Self::discover_systems(gateway_url).await?;
+        let systems = Self::discover_systems(gateway_url, diagnostic_log.as_ref())
+            .await
+            .context("Rithmic system discovery failed")?;
         anyhow::ensure!(
             systems.system_name.iter().any(|name| name == &credentials.system_name),
             "Rithmic system '{}' is unavailable, available systems: {}",
@@ -106,6 +156,21 @@ impl RithmicSession {
         let InboundMessage::Login(login) = response else {
             anyhow::bail!("Rithmic login returned an unexpected response")
         };
+        if let Some(log) = &diagnostic_log {
+            log.record(
+                "ticker_plant_login",
+                if login.rp_code.first().is_some_and(|code| code == "0") {
+                    "success"
+                } else {
+                    "error"
+                },
+                serde_json::json!({
+                    "system_name": credentials.system_name,
+                    "rp_code": login.rp_code,
+                    "heartbeat_interval": login.heartbeat_interval,
+                }),
+            );
+        }
         let heartbeat_interval = heartbeat_interval(&login)?;
 
         log::info!(
@@ -116,6 +181,8 @@ impl RithmicSession {
         Ok(Self {
             socket,
             heartbeat_interval,
+            available_systems: systems.system_name,
+            diagnostic_log,
         })
     }
 
@@ -124,12 +191,17 @@ impl RithmicSession {
         credentials: &LoginCredentials,
         subscriptions: &[MarketSubscription],
         timeout: Duration,
+        front_month_fallback: Option<&str>,
+        diagnostic_log_dir: Option<&str>,
     ) -> anyhow::Result<(Self, Vec<MarketSubscription>)> {
         tokio::time::timeout(timeout, async {
-            let mut session = Self::connect_inner(gateway_url, credentials).await?;
+            let diagnostic_log = DiagnosticLog::create(diagnostic_log_dir)?;
+            let mut session = Self::connect_inner(gateway_url, credentials, diagnostic_log).await?;
             let mut resolved = Vec::with_capacity(subscriptions.len());
             for subscription in subscriptions {
-                let subscription = session.resolve_subscription(subscription).await?;
+                let subscription = session
+                    .resolve_subscription(subscription, front_month_fallback)
+                    .await?;
                 session.subscribe(&subscription).await?;
                 resolved.push(subscription);
             }
@@ -142,6 +214,7 @@ impl RithmicSession {
     async fn resolve_subscription(
         &mut self,
         subscription: &MarketSubscription,
+        front_month_fallback: Option<&str>,
     ) -> anyhow::Result<MarketSubscription> {
         if looks_like_futures_contract(&subscription.symbol) {
             return Ok(subscription.clone());
@@ -160,10 +233,53 @@ impl RithmicSession {
         let InboundMessage::FrontMonth(response) = response else {
             anyhow::bail!("Rithmic front-month lookup returned an unexpected response")
         };
-        resolved_subscription(subscription, &response)
+        if let Some(log) = &self.diagnostic_log {
+            log.record(
+                "front_month_discovery",
+                if response.rp_code.first().is_some_and(|code| code == "0") {
+                    "success"
+                } else {
+                    "error"
+                },
+                serde_json::json!({
+                    "requested": format!("{}.{}", subscription.exchange, subscription.symbol),
+                    "rp_code": response.rp_code,
+                    "trading_exchange": response.trading_exchange,
+                    "trading_symbol": response.trading_symbol,
+                }),
+            );
+        }
+        match resolved_subscription(subscription, &response) {
+            Ok(resolved) => Ok(resolved),
+            Err(e) if front_month_unavailable(&response) => {
+                let fallback = parse_fallback(front_month_fallback, subscription)?;
+                log::warn!(
+                    "Rithmic front-month discovery unavailable for {}.{} ({e}); using {}.{}",
+                    subscription.exchange,
+                    subscription.symbol,
+                    fallback.exchange,
+                    fallback.symbol,
+                );
+                if let Some(log) = &self.diagnostic_log {
+                    log.record(
+                        "front_month_fallback",
+                        "selected",
+                        serde_json::json!({
+                            "contract": format!("{}.{}", fallback.exchange, fallback.symbol),
+                            "reason": e.to_string(),
+                        }),
+                    );
+                }
+                Ok(fallback)
+            }
+            Err(e) => Err(e).context("Rithmic front-month discovery failed"),
+        }
     }
 
-    async fn discover_systems(gateway_url: &str) -> anyhow::Result<ResponseSystemInfo> {
+    async fn discover_systems(
+        gateway_url: &str,
+        diagnostic_log: Option<&Arc<DiagnosticLog>>,
+    ) -> anyhow::Result<ResponseSystemInfo> {
         let (mut socket, _) = connect_async(gateway_url).await?;
         let request = RequestSystemInfo {
             template_id: SYSTEM_INFO_REQUEST_TEMPLATE_ID,
@@ -174,9 +290,32 @@ impl RithmicSession {
         let InboundMessage::SystemInfo(systems) = response else {
             anyhow::bail!("Rithmic system discovery returned an unexpected response")
         };
+        if let Some(log) = diagnostic_log {
+            log.record(
+                "system_discovery",
+                if systems.rp_code.first().is_some_and(|code| code == "0") {
+                    "success"
+                } else {
+                    "error"
+                },
+                serde_json::json!({
+                    "rp_code": systems.rp_code,
+                    "system_names": systems.system_name,
+                    "has_aggregated_quotes": systems.has_aggregated_quotes,
+                }),
+            );
+        }
         Self::ensure_codes_succeed(systems.template_id, &systems.rp_code)?;
         socket.close(None).await?;
         Ok(systems)
+    }
+
+    pub(crate) fn available_systems(&self) -> &[String] {
+        &self.available_systems
+    }
+
+    pub(crate) fn diagnostic_log_path(&self) -> Option<&Path> {
+        self.diagnostic_log.as_ref().map(|log| log.path.as_path())
     }
 
     pub(crate) async fn subscribe(
@@ -259,6 +398,17 @@ impl RithmicSession {
                     anyhow::bail!("Rithmic forced logout received")
                 }
                 InboundMessage::MarketDataResponse(response) => {
+                    if let Some(log) = &self.diagnostic_log {
+                        log.record(
+                            "market_data_subscription",
+                            if response.rp_code.first().is_some_and(|code| code == "0") {
+                                "success"
+                            } else {
+                                "error"
+                            },
+                            serde_json::json!({"rp_code": response.rp_code}),
+                        );
+                    }
                     ensure_response_success(&response)?;
                     log::debug!("Rithmic market-data subscription accepted");
                 }
@@ -394,6 +544,10 @@ impl RithmicSession {
 }
 
 fn looks_like_futures_contract(symbol: &str) -> bool {
+    futures_contract_root(symbol).is_some()
+}
+
+fn futures_contract_root(symbol: &str) -> Option<&str> {
     const MONTH_CODES: &str = "FGHJKMNQUVXZ";
 
     let year_digits = symbol
@@ -403,11 +557,11 @@ fn looks_like_futures_contract(symbol: &str) -> bool {
         .take_while(|byte| byte.is_ascii_digit())
         .count();
     if year_digits == 0 || year_digits > 4 || symbol.len() <= year_digits {
-        return false;
+        return None;
     }
     let month_index = symbol.len() - year_digits - 1;
     let month = symbol.as_bytes()[month_index] as char;
-    month_index > 0 && MONTH_CODES.contains(month)
+    (month_index > 0 && MONTH_CODES.contains(month)).then_some(&symbol[..month_index])
 }
 
 fn resolved_subscription(
@@ -435,6 +589,40 @@ fn resolved_subscription(
     );
     Ok(MarketSubscription::new(
         response.trading_symbol.clone(),
+        exchange,
+        requested.update_bits,
+    ))
+}
+
+fn front_month_unavailable(response: &ResponseFrontMonthContract) -> bool {
+    response.rp_code.first().is_some_and(|code| code == "7")
+        || (response.rp_code.first().is_some_and(|code| code == "0")
+            && response.trading_symbol.is_empty())
+}
+
+fn parse_fallback(
+    value: Option<&str>,
+    requested: &MarketSubscription,
+) -> anyhow::Result<MarketSubscription> {
+    let value = value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Rithmic returned no front-month data for {}.{} and no fallback was configured",
+            requested.exchange,
+            requested.symbol
+        )
+    })?;
+    let (exchange, symbol) = value.split_once('.').ok_or_else(|| {
+        anyhow::anyhow!("Invalid Rithmic front-month fallback '{value}': expected EXCHANGE.SYMBOL")
+    })?;
+    anyhow::ensure!(
+        exchange == requested.exchange
+            && futures_contract_root(symbol).is_some_and(|root| root == requested.symbol),
+        "Invalid Rithmic front-month fallback '{value}': expected an explicit contract for {}.{}",
+        requested.exchange,
+        requested.symbol,
+    );
+    Ok(MarketSubscription::new(
+        symbol,
         exchange,
         requested.update_bits,
     ))
@@ -519,5 +707,30 @@ mod tests {
         };
 
         assert!(resolved_subscription(&requested, &response).is_err());
+    }
+
+    #[rstest]
+    fn maps_no_data_to_explicit_fallback() {
+        let requested = MarketSubscription::all_market_data("MES", "CME");
+        let response = ResponseFrontMonthContract {
+            template_id: FRONT_MONTH_RESPONSE_TEMPLATE_ID,
+            rp_code: vec!["7".to_string(), "no data".to_string()],
+            ..Default::default()
+        };
+
+        assert!(front_month_unavailable(&response));
+        let fallback = parse_fallback(Some("CME.MESU6"), &requested).unwrap();
+        assert_eq!(fallback.symbol, "MESU6");
+        assert_eq!(fallback.exchange, "CME");
+        assert_eq!(fallback.update_bits, requested.update_bits);
+    }
+
+    #[rstest]
+    fn rejects_invalid_front_month_fallback() {
+        let requested = MarketSubscription::all_market_data("MES", "CME");
+        assert!(parse_fallback(Some("MESU6"), &requested).is_err());
+        assert!(parse_fallback(Some("CME.MES"), &requested).is_err());
+        assert!(parse_fallback(Some("CME.NQU6"), &requested).is_err());
+        assert!(parse_fallback(Some("CBOT.MESU6"), &requested).is_err());
     }
 }

@@ -25,6 +25,10 @@ use crate::{
 /// Results from one live Rithmic ticker-plant connection probe.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RithmicConnectionProbeResult {
+    /// Systems returned by Rithmic system discovery before login.
+    pub available_systems: Vec<String>,
+    /// JSONL file containing credential-safe discovery and connection responses.
+    pub diagnostic_log_path: Option<String>,
     /// Contracts used for the actual Rithmic market-data subscriptions.
     pub resolved_subscriptions: Vec<String>,
     /// Number of native Nautilus trade ticks received.
@@ -68,10 +72,16 @@ pub async fn run_connection_probe(
         &credentials,
         &subscriptions,
         connect_timeout,
+        config.front_month_fallback.as_deref(),
+        config.diagnostic_log_dir.as_deref(),
     )
     .await?;
 
     let mut result = RithmicConnectionProbeResult {
+        available_systems: session.available_systems().to_vec(),
+        diagnostic_log_path: session
+            .diagnostic_log_path()
+            .map(|path| path.display().to_string()),
         resolved_subscriptions: resolved
             .iter()
             .map(|subscription| format!("{}.{}", subscription.exchange, subscription.symbol))

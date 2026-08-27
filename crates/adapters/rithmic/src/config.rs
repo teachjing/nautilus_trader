@@ -33,6 +33,10 @@ pub struct RithmicDataClientConfig {
     /// Provider-neutral roots such as `CME.MES`.
     #[builder(default)]
     pub market_subscriptions: Vec<String>,
+    /// Explicit contract used when front-month discovery returns no data.
+    pub front_month_fallback: Option<String>,
+    /// Directory for credential-safe Rithmic discovery and connection logs.
+    pub diagnostic_log_dir: Option<String>,
     /// Calendar days before expiration to roll to the next contract.
     #[builder(default = 7)]
     pub rollover_days: u16,
@@ -64,6 +68,8 @@ impl Debug for RithmicDataClientConfig {
             .field("username", &self.username.as_ref().map(|_| "<redacted>"))
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("market_subscriptions", &self.market_subscriptions)
+            .field("front_month_fallback", &self.front_month_fallback)
+            .field("diagnostic_log_dir", &self.diagnostic_log_dir)
             .field("rollover_days", &self.rollover_days)
             .field("subscribe_book_deltas", &self.subscribe_book_deltas)
             .field("subscribe_quotes", &self.subscribe_quotes)
@@ -95,6 +101,8 @@ nautilus_core::impl_pyo3_config_getters!(RithmicDataClientConfig {
     gateway_url: String,
     system_name: String,
     market_subscriptions: Vec<String>,
+    front_month_fallback: Option<String>,
+    diagnostic_log_dir: Option<String>,
     rollover_days: u16,
     subscribe_book_deltas: bool,
     subscribe_quotes: bool,
@@ -114,6 +122,8 @@ mod tests {
     fn default_config_uses_provider_neutral_discovery() {
         let config = RithmicDataClientConfig::default();
         assert!(config.market_subscriptions.is_empty());
+        assert!(config.front_month_fallback.is_none());
+        assert!(config.diagnostic_log_dir.is_none());
         assert_eq!(config.rollover_days, 7);
         assert!(config.subscribe_book_deltas);
         assert!(config.subscribe_quotes);

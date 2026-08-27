@@ -64,13 +64,24 @@ export RITHMIC_PASSWORD="your-password"
 export RITHMIC_SYSTEM_NAME="Rithmic Paper Trading"
 export RITHMIC_GATEWAY_URL="wss://rprotocol-mobile.rithmic.com/"
 export RITHMIC_LIVE_SUBSCRIPTION="CME.MES"
+export RITHMIC_LIVE_FALLBACK_SUBSCRIPTION="CME.MESU6"
 export RITHMIC_LIVE_DURATION_SECS="30"
+export RITHMIC_DIAGNOSTIC_LOG_DIR="target/rithmic-diagnostics"
 
 cargo test -p nautilus-rithmic \
   --test live_connection \
   --features live-tests \
   -- --ignored --nocapture
 ```
+
+The probe always validates that `RITHMIC_SYSTEM_NAME` is present in the template 17 system-info
+response before logging in. It then attempts template 113/114 front-month discovery. If Rithmic
+returns `7: no data`, the probe uses `RITHMIC_LIVE_FALLBACK_SUBSCRIPTION` and continues.
+
+Credential-safe JSONL logs are written under `RITHMIC_DIAGNOSTIC_LOG_DIR`. They contain system
+names, response codes, contract-resolution results, fallback selection, and subscription status,
+but never the Rithmic username or password. The result printed by the test includes the exact log
+path.
 
 For a bounded multi-symbol probe, set a comma-separated list and run the example:
 

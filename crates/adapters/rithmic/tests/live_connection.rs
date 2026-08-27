@@ -24,6 +24,10 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
         .unwrap_or_else(|_| "wss://rprotocol-mobile.rithmic.com/".to_string());
     let subscription =
         std::env::var("RITHMIC_LIVE_SUBSCRIPTION").unwrap_or_else(|_| "CME.MES".to_string());
+    let fallback = std::env::var("RITHMIC_LIVE_FALLBACK_SUBSCRIPTION")
+        .unwrap_or_else(|_| "CME.MESU6".to_string());
+    let diagnostic_log_dir = std::env::var("RITHMIC_DIAGNOSTIC_LOG_DIR")
+        .unwrap_or_else(|_| "target/rithmic-diagnostics".to_string());
     let duration_secs = std::env::var("RITHMIC_LIVE_DURATION_SECS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -32,8 +36,11 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
         system_name,
         gateway_url,
         market_subscriptions: vec![subscription],
+        front_month_fallback: Some(fallback),
+        diagnostic_log_dir: Some(diagnostic_log_dir),
         ..Default::default()
     };
+    let expected_system_name = config.system_name.clone();
 
     let result = run_connection_probe(config, Duration::from_secs(duration_secs))
         .await
@@ -41,6 +48,8 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
     println!("Rithmic live connection result: {result:#?}");
 
     assert!(!result.resolved_subscriptions.is_empty());
+    assert!(result.available_systems.contains(&expected_system_name));
+    assert!(result.diagnostic_log_path.is_some());
     assert!(
         result.total_events() > 0,
         "Connected successfully but received no native market-data events; \
