@@ -51,3 +51,30 @@ cargo check -p nautilus-rithmic
 cargo test -p nautilus-rithmic -- --nocapture
 ```
 
+### Live connection validation
+
+Live validation is excluded from normal tests because it requires credentials, exchange
+entitlements, and an active market. The test performs system discovery, ticker-plant login,
+front-month resolution, market-data subscriptions, native Nautilus conversion, unsubscribe, and
+logout.
+
+```bash
+export RITHMIC_USER="your-user"
+export RITHMIC_PASSWORD="your-password"
+export RITHMIC_SYSTEM_NAME="Rithmic Paper Trading"
+export RITHMIC_GATEWAY_URL="wss://rprotocol-mobile.rithmic.com/"
+export RITHMIC_LIVE_SUBSCRIPTION="CME.MES"
+export RITHMIC_LIVE_DURATION_SECS="30"
+
+cargo test -p nautilus-rithmic \
+  --test live_connection \
+  --features live-tests \
+  -- --ignored --nocapture
+```
+
+For a bounded multi-symbol probe, set a comma-separated list and run the example:
+
+```bash
+export RITHMIC_LIVE_SUBSCRIPTIONS="CME.MES,CME.NQ"
+cargo run -p nautilus-rithmic --example node_data_tester
+```

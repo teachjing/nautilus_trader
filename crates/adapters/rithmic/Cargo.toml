@@ -39,6 +39,7 @@ python = [
   "pyo3-stub-gen",
 ]
 high-precision = ["nautilus-model/high-precision"]
+live-tests = []
 
 [dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
