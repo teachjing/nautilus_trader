@@ -215,6 +215,8 @@ pub struct ResponseFrontMonthContract {
     pub exchange: String,
     #[prost(bool, tag = "149166")]
     pub is_front_month_symbol: bool,
+    #[prost(string, tag = "100003")]
+    pub symbol_name: String,
     #[prost(string, tag = "157095")]
     pub trading_symbol: String,
     #[prost(string, tag = "157096")]

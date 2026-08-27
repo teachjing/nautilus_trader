@@ -31,8 +31,10 @@ use crate::{
     protocol::{
         FORCED_LOGOUT_TEMPLATE_ID, InboundMessage, LOGOUT_REQUEST_TEMPLATE_ID,
         LOGIN_RESPONSE_TEMPLATE_ID, REJECT_TEMPLATE_ID, RequestLogout, RequestSystemInfo,
-        ResponseCode, ResponseSystemInfo, SYSTEM_INFO_REQUEST_TEMPLATE_ID,
-        SYSTEM_INFO_RESPONSE_TEMPLATE_ID, SubscriptionRequest, decode_inbound, encode_frame,
+        RequestFrontMonthContract, ResponseCode, ResponseFrontMonthContract, ResponseSystemInfo,
+        SYSTEM_INFO_REQUEST_TEMPLATE_ID, SYSTEM_INFO_RESPONSE_TEMPLATE_ID, SubscriptionRequest,
+        FRONT_MONTH_REQUEST_TEMPLATE_ID, FRONT_MONTH_RESPONSE_TEMPLATE_ID, decode_inbound,
+        encode_frame,
     },
 };
 
@@ -120,16 +122,43 @@ impl RithmicSession {
         credentials: &LoginCredentials,
         subscriptions: &[MarketSubscription],
         timeout: Duration,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, Vec<MarketSubscription>)> {
         tokio::time::timeout(timeout, async {
             let mut session = Self::connect_inner(gateway_url, credentials).await?;
+            let mut resolved = Vec::with_capacity(subscriptions.len());
             for subscription in subscriptions {
-                session.subscribe(subscription).await?;
+                let subscription = session.resolve_subscription(subscription).await?;
+                session.subscribe(&subscription).await?;
+                resolved.push(subscription);
             }
-            Ok(session)
+            Ok((session, resolved))
         })
         .await
         .map_err(|_| anyhow::anyhow!("Rithmic setup timed out after {timeout:?}"))?
+    }
+
+    async fn resolve_subscription(
+        &mut self,
+        subscription: &MarketSubscription,
+    ) -> anyhow::Result<MarketSubscription> {
+        if looks_like_futures_contract(&subscription.symbol) {
+            return Ok(subscription.clone());
+        }
+
+        let request = RequestFrontMonthContract {
+            template_id: FRONT_MONTH_REQUEST_TEMPLATE_ID,
+            symbol: subscription.symbol.clone(),
+            exchange: subscription.exchange.clone(),
+            need_updates: false,
+            ..Default::default()
+        };
+        Self::send_protobuf(&mut self.socket, &request).await?;
+        let response = Self::receive_expected(&mut self.socket, FRONT_MONTH_RESPONSE_TEMPLATE_ID)
+            .await?;
+        let InboundMessage::FrontMonth(response) = response else {
+            anyhow::bail!("Rithmic front-month lookup returned an unexpected response")
+        };
+        resolved_subscription(subscription, &response)
     }
 
     async fn discover_systems(gateway_url: &str) -> anyhow::Result<ResponseSystemInfo> {
@@ -362,6 +391,53 @@ impl RithmicSession {
     }
 }
 
+fn looks_like_futures_contract(symbol: &str) -> bool {
+    const MONTH_CODES: &str = "FGHJKMNQUVXZ";
+
+    let year_digits = symbol
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if year_digits == 0 || year_digits > 4 || symbol.len() <= year_digits {
+        return false;
+    }
+    let month_index = symbol.len() - year_digits - 1;
+    let month = symbol.as_bytes()[month_index] as char;
+    month_index > 0 && MONTH_CODES.contains(month)
+}
+
+fn resolved_subscription(
+    requested: &MarketSubscription,
+    response: &ResponseFrontMonthContract,
+) -> anyhow::Result<MarketSubscription> {
+    RithmicSession::ensure_codes_succeed(response.template_id, &response.rp_code)?;
+    anyhow::ensure!(
+        !response.trading_symbol.is_empty(),
+        "Rithmic returned no front-month contract for {}.{}",
+        requested.exchange,
+        requested.symbol
+    );
+    let exchange = if response.trading_exchange.is_empty() {
+        requested.exchange.clone()
+    } else {
+        response.trading_exchange.clone()
+    };
+    log::info!(
+        "Resolved Rithmic root {}.{} to {}.{}",
+        requested.exchange,
+        requested.symbol,
+        exchange,
+        response.trading_symbol
+    );
+    Ok(MarketSubscription::new(
+        response.trading_symbol.clone(),
+        exchange,
+        requested.update_bits,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -402,5 +478,44 @@ mod tests {
         assert!(
             ReconnectBackoff::new(Duration::from_secs(31), Duration::from_secs(30)).is_err()
         );
+    }
+
+    #[rstest]
+    #[case("MESU6", true)]
+    #[case("ESZ26", true)]
+    #[case("NQH2027", true)]
+    #[case("MES", false)]
+    #[case("6E", false)]
+    fn identifies_explicit_futures_contracts(#[case] symbol: &str, #[case] expected: bool) {
+        assert_eq!(looks_like_futures_contract(symbol), expected);
+    }
+
+    #[rstest]
+    fn maps_front_month_response_and_preserves_update_bits() {
+        let requested = MarketSubscription::all_market_data("MES", "CME");
+        let response = ResponseFrontMonthContract {
+            template_id: FRONT_MONTH_RESPONSE_TEMPLATE_ID,
+            rp_code: vec!["0".to_string()],
+            trading_symbol: "MESU6".to_string(),
+            trading_exchange: "CME".to_string(),
+            ..Default::default()
+        };
+
+        let resolved = resolved_subscription(&requested, &response).unwrap();
+        assert_eq!(resolved.symbol, "MESU6");
+        assert_eq!(resolved.exchange, "CME");
+        assert_eq!(resolved.update_bits, requested.update_bits);
+    }
+
+    #[rstest]
+    fn rejects_empty_front_month_response() {
+        let requested = MarketSubscription::all_market_data("MES", "CME");
+        let response = ResponseFrontMonthContract {
+            template_id: FRONT_MONTH_RESPONSE_TEMPLATE_ID,
+            rp_code: vec!["0".to_string()],
+            ..Default::default()
+        };
+
+        assert!(resolved_subscription(&requested, &response).is_err());
     }
 }

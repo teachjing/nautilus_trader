@@ -196,7 +196,7 @@ impl DataClient for RithmicDataClient {
         let connect_timeout = Duration::from_secs(self.config.connect_timeout_secs);
         let initial_delay = Duration::from_secs(self.config.reconnect_delay_initial_secs);
         let maximum_delay = Duration::from_secs(self.config.reconnect_delay_max_secs);
-        let session = RithmicSession::connect_subscribed(
+        let (session, resolved_subscriptions) = RithmicSession::connect_subscribed(
             &gateway_url,
             &credentials,
             &subscriptions,
@@ -213,17 +213,17 @@ impl DataClient for RithmicDataClient {
         let clock = self.clock;
         connected.store(true, Ordering::Release);
         self.session_task = Some(get_runtime().spawn(async move {
-            let mut active_session = Some(session);
+            let mut active_session = Some((session, resolved_subscriptions));
             let mut backoff = ReconnectBackoff::new(initial_delay, maximum_delay)
                 .expect("validated Rithmic reconnect delays");
 
             loop {
-                let session = active_session
+                let (session, resolved_subscriptions) = active_session
                     .take()
                     .expect("Rithmic session available before run");
                 let result = session
                     .run(
-                        subscriptions.clone(),
+                        resolved_subscriptions,
                         data_sender.clone(),
                         clock,
                         cancel.clone(),
@@ -256,8 +256,8 @@ impl DataClient for RithmicDataClient {
                     )
                     .await
                     {
-                        Ok(session) => {
-                            active_session = Some(session);
+                        Ok((session, resolved_subscriptions)) => {
+                            active_session = Some((session, resolved_subscriptions));
                             backoff.reset();
                             connected.store(true, Ordering::Release);
                             log::info!("Rithmic ticker plant reconnected and resubscribed");
