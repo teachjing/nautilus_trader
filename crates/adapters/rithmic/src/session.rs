@@ -780,6 +780,39 @@ impl RithmicSession {
         Ok(catalog)
     }
 
+    pub(crate) async fn search_instruments(
+        gateway_url: &str,
+        credentials: &LoginCredentials,
+        exchange: &str,
+        search_text: &str,
+        diagnostic_log_dir: Option<&str>,
+    ) -> anyhow::Result<Vec<RithmicInstrumentInfo>> {
+        let diagnostic_log = DiagnosticLog::create(diagnostic_log_dir)?;
+        let mut session = Self::connect_inner(
+            gateway_url,
+            credentials,
+            diagnostic_log.clone(),
+            InfrastructureType::TickerPlant,
+        )
+        .await?;
+        let instruments = session
+            .search_futures_by_text(exchange, search_text, None)
+            .await?;
+        session.logout_and_close().await?;
+        if let Some(log) = &diagnostic_log {
+            log.record(
+                "instrument_search",
+                "success",
+                serde_json::json!({
+                    "exchange": exchange,
+                    "search_text": search_text,
+                    "matches": instruments.len(),
+                }),
+            );
+        }
+        Ok(instruments)
+    }
+
     pub(crate) async fn logout_and_close(&mut self) -> anyhow::Result<()> {
         let logout = RequestLogout {
             template_id: LOGOUT_REQUEST_TEMPLATE_ID,
@@ -952,12 +985,22 @@ impl RithmicSession {
         exchange: &str,
         product_code: &str,
     ) -> anyhow::Result<Vec<RithmicInstrumentInfo>> {
+        self.search_futures_by_text(exchange, product_code, Some(product_code))
+            .await
+    }
+
+    async fn search_futures_by_text(
+        &mut self,
+        exchange: &str,
+        search_text: &str,
+        product_code: Option<&str>,
+    ) -> anyhow::Result<Vec<RithmicInstrumentInfo>> {
         let request = RequestSearchSymbols {
             template_id: SEARCH_SYMBOLS_REQUEST_TEMPLATE_ID,
-            user_msg: vec![format!("catalog_instruments:{exchange}:{product_code}")],
-            search_text: product_code.to_string(),
+            user_msg: vec![format!("instrument_search:{exchange}:{search_text}")],
+            search_text: search_text.to_string(),
             exchange: exchange.to_string(),
-            product_code: product_code.to_string(),
+            product_code: product_code.unwrap_or_default().to_string(),
             instrument_type: SearchInstrumentType::Future as i32,
             pattern: SearchPattern::Contains as i32,
         };

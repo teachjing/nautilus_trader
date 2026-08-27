@@ -27,11 +27,83 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::RithmicDataClientConfig,
-    discovery::RithmicExchangeInfo,
+    discovery::{RithmicExchangeInfo, RithmicInstrumentInfo},
     flow::{LoginCredentials, MarketSubscription},
     protocol::update_bits,
     session::{RawOrderBookMetrics, RithmicSession},
 };
+
+/// Result of a focused Rithmic futures-contract search for one exchange.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RithmicInstrumentSearchResult {
+    pub output_path: String,
+    pub exchange: String,
+    pub search_text: String,
+    pub match_count: usize,
+    pub instruments: Vec<RithmicInstrumentInfo>,
+}
+
+/// Searches futures contracts on one selected market and saves the results as JSON.
+///
+/// # Errors
+///
+/// Returns an error for an empty exchange/search string, unavailable credentials, connection or
+/// protocol failures, timeout, or an output-file failure.
+pub async fn run_instrument_search(
+    config: &RithmicDataClientConfig,
+    exchange: &str,
+    search_text: &str,
+) -> anyhow::Result<RithmicInstrumentSearchResult> {
+    let exchange = exchange.trim().to_ascii_uppercase();
+    let search_text = search_text.trim().to_ascii_uppercase();
+    anyhow::ensure!(!exchange.is_empty(), "Rithmic instrument search exchange is required");
+    anyhow::ensure!(
+        !search_text.is_empty(),
+        "Rithmic instrument search text is required"
+    );
+    let credentials = credentials(config)?;
+    let timeout_secs = std::env::var("RITHMIC_DISCOVERY_TIMEOUT_SECS")
+        .ok()
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid RITHMIC_DISCOVERY_TIMEOUT_SECS: {e}"))?
+        .unwrap_or(120);
+    let instruments = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        RithmicSession::search_instruments(
+            &config.gateway_url,
+            &credentials,
+            &exchange,
+            &search_text,
+            config.diagnostic_log_dir.as_deref(),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Rithmic instrument search for {exchange}.{search_text} timed out after {timeout_secs}s"
+        )
+    })??;
+    let output_dir = config
+        .diagnostic_log_dir
+        .as_deref()
+        .unwrap_or("target/rithmic-diagnostics");
+    let output_path = std::path::Path::new(output_dir).join(format!(
+        "rithmic-instrument-search-{exchange}-{search_text}.json"
+    ));
+    let result = RithmicInstrumentSearchResult {
+        output_path: output_path.display().to_string(),
+        exchange,
+        search_text,
+        match_count: instruments.len(),
+        instruments,
+    };
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&output_path, serde_json::to_vec_pretty(&result)?)?;
+    Ok(result)
+}
 
 /// Result of querying every market-data exchange permission for the authenticated user.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

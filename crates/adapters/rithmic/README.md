@@ -126,6 +126,22 @@ The test prints every market returned by Rithmic with its entitlement flag and r
 access. It also writes the same result to
 `target/rithmic-diagnostics/rithmic-market-entitlements.json`.
 
+Search contracts interactively for one selected market and search string:
+
+```bash
+export RITHMIC_SEARCH_EXCHANGE="CME"
+export RITHMIC_SEARCH_TEXT="MES"
+
+cargo test -p nautilus-rithmic \
+  --test live_instrument_search \
+  --features live-tests \
+  -- --ignored --nocapture
+```
+
+This uses templates 109/110 directly and writes the typed matches to
+`target/rithmic-diagnostics/rithmic-instrument-search-CME-MES.json`. The public Rust function
+`run_instrument_search` provides the same focused operation for a future UI/API endpoint.
+
 ## Historical time-bar replay
 
 The Rithmic reference guide assigns templates 202/203 to the History Plant. Replay responses carry
