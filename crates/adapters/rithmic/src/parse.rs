@@ -17,7 +17,8 @@ use nautilus_model::{
 };
 
 use crate::protocol::{
-    BestBidOffer, BookUpdateType, LastTrade, OrderBook, TransactionType, book_presence_bits,
+    BestBidOffer, BookUpdateType, DepthByOrder, DepthTransactionType, DepthUpdateType, LastTrade,
+    OrderBook, ResponseDepthByOrderSnapshot, TransactionType, book_presence_bits,
     quote_presence_bits, trade_presence_bits,
 };
 
@@ -144,10 +145,18 @@ pub fn parse_order_book(
 ) -> anyhow::Result<OrderBookDeltas> {
     validate_book_arrays(update)?;
     let instrument_id = instrument_id(&update.symbol, &update.exchange)?;
-    let ts_event = timestamp(update.ssboe, update.usecs)
-        .ok_or_else(|| anyhow::anyhow!("Rithmic order-book timestamp is invalid"))?;
     let update_type = BookUpdateType::try_from(update.update_type)
         .unwrap_or(BookUpdateType::Unspecified);
+    let ts_event = timestamp(update.ssboe, update.usecs).or_else(|| {
+        matches!(
+            update_type,
+            BookUpdateType::SnapshotImage
+                | BookUpdateType::ClearOrderBook
+                | BookUpdateType::NoBook
+        )
+        .then_some(ts_init)
+    })
+    .ok_or_else(|| anyhow::anyhow!("Rithmic order-book timestamp is invalid"))?;
     let snapshot = update_type == BookUpdateType::SnapshotImage;
     let terminal = matches!(
         update_type,
@@ -260,6 +269,154 @@ fn validate_book_arrays(update: &OrderBook) -> anyhow::Result<()> {
         "Rithmic ask price/size array lengths differ"
     );
     Ok(())
+}
+
+/// Converts one Rithmic depth-by-order snapshot response into native L3 deltas.
+///
+/// # Errors
+///
+/// Returns an error for invalid array lengths, prices, sizes, sides, or order identifiers.
+pub fn parse_depth_by_order_snapshot(
+    response: &ResponseDepthByOrderSnapshot,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderBookDeltas> {
+    anyhow::ensure!(
+        response.depth_size.len() == response.exchange_order_id.len(),
+        "Rithmic MBO snapshot size/order ID array lengths differ"
+    );
+    anyhow::ensure!(
+        response.depth_order_priority.is_empty()
+            || response.depth_order_priority.len() == response.depth_size.len(),
+        "Rithmic MBO snapshot priority array length differs"
+    );
+    validate_price(response.depth_price, "MBO snapshot price")?;
+    let side = depth_side(response.depth_side)?;
+    let instrument_id = instrument_id(&response.symbol, &response.exchange)?;
+    let mut deltas = Vec::with_capacity(response.depth_size.len());
+    for (&size, exchange_order_id) in response.depth_size.iter().zip(&response.exchange_order_id) {
+        anyhow::ensure!(size > 0, "Rithmic MBO snapshot size must be positive");
+        deltas.push(OrderBookDelta::new(
+            instrument_id,
+            BookAction::Add,
+            BookOrder::new(
+                side,
+                price(response.depth_price),
+                Quantity::new(size as f64, 0),
+                mbo_order_id(exchange_order_id)?,
+            ),
+            RecordFlag::F_SNAPSHOT as u8,
+            response.sequence_number,
+            ts_init,
+            ts_init,
+        ));
+    }
+    anyhow::ensure!(!deltas.is_empty(), "Rithmic MBO snapshot contains no orders");
+    if !response.rp_code.is_empty() {
+        if let Some(last) = deltas.last_mut() {
+            last.flags |= RecordFlag::F_LAST as u8;
+        }
+    }
+    OrderBookDeltas::new_checked(instrument_id, deltas)
+}
+
+/// Converts a Rithmic depth-by-order update into native L3 deltas.
+///
+/// # Errors
+///
+/// Returns an error for invalid arrays, prices, sizes, sides, update types, or order identifiers.
+pub fn parse_depth_by_order_update(
+    update: &DepthByOrder,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderBookDeltas> {
+    let len = update.update_type.len();
+    anyhow::ensure!(
+        len == update.transaction_type.len()
+            && len == update.depth_price.len()
+            && len == update.depth_size.len()
+            && len == update.exchange_order_id.len()
+            && (update.depth_order_priority.is_empty()
+                || len == update.depth_order_priority.len()),
+        "Rithmic MBO update arrays differ"
+    );
+    let instrument_id = instrument_id(&update.symbol, &update.exchange)?;
+    let ts_event = source_timestamp(update.source_ssboe, update.source_usecs, update.source_nsecs)
+        .or_else(|| timestamp(update.ssboe, update.usecs))
+        .unwrap_or(ts_init);
+    let mut deltas = Vec::with_capacity(len.saturating_mul(2));
+    for index in 0..len {
+        let side = depth_side(update.transaction_type[index])?;
+        let action = DepthUpdateType::try_from(update.update_type[index])
+            .map_err(|_| anyhow::anyhow!("Unknown Rithmic MBO update type"))?;
+        let order_id = mbo_order_id(&update.exchange_order_id[index])?;
+        let current_price = update.depth_price[index];
+        validate_price(current_price, "MBO update price")?;
+        let size = update.depth_size[index];
+        anyhow::ensure!(size >= 0, "Rithmic MBO size cannot be negative");
+        if matches!(action, DepthUpdateType::New | DepthUpdateType::Change) {
+            anyhow::ensure!(size > 0, "Rithmic MBO add/update size must be positive");
+        }
+        let price_changed = action == DepthUpdateType::Change
+            && update.prev_depth_price_flag.get(index).copied().unwrap_or(false);
+        if price_changed {
+            let previous_price = *update.prev_depth_price.get(index).ok_or_else(|| {
+                anyhow::anyhow!("Rithmic MBO previous-price flag has no matching price")
+            })?;
+            validate_price(previous_price, "MBO previous price")?;
+            deltas.push(OrderBookDelta::new(
+                instrument_id,
+                BookAction::Delete,
+                BookOrder::new(side, price(previous_price), Quantity::new(0.0, 0), order_id),
+                0,
+                update.sequence_number,
+                ts_event,
+                ts_init,
+            ));
+        }
+        let book_action = match action {
+            DepthUpdateType::New => BookAction::Add,
+            DepthUpdateType::Change if price_changed => BookAction::Add,
+            DepthUpdateType::Change => BookAction::Update,
+            DepthUpdateType::Delete => BookAction::Delete,
+            DepthUpdateType::Unspecified => anyhow::bail!("Unspecified Rithmic MBO update type"),
+        };
+        deltas.push(OrderBookDelta::new(
+            instrument_id,
+            book_action,
+            BookOrder::new(
+                side,
+                price(current_price),
+                Quantity::new(size as f64, 0),
+                order_id,
+            ),
+            0,
+            update.sequence_number,
+            ts_event,
+            ts_init,
+        ));
+    }
+    anyhow::ensure!(!deltas.is_empty(), "Rithmic MBO update contains no orders");
+    if let Some(last) = deltas.last_mut() {
+        last.flags |= RecordFlag::F_LAST as u8;
+    }
+    OrderBookDeltas::new_checked(instrument_id, deltas)
+}
+
+fn depth_side(value: i32) -> anyhow::Result<OrderSide> {
+    match DepthTransactionType::try_from(value) {
+        Ok(DepthTransactionType::Buy) => Ok(OrderSide::Buy),
+        Ok(DepthTransactionType::Sell) => Ok(OrderSide::Sell),
+        _ => anyhow::bail!("Unspecified Rithmic MBO side"),
+    }
+}
+
+pub(crate) fn mbo_order_id(value: &str) -> anyhow::Result<u64> {
+    anyhow::ensure!(!value.is_empty(), "Rithmic MBO exchange order ID is empty");
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(if hash == 0 { 1 } else { hash })
 }
 
 fn instrument_id(symbol: &str, exchange: &str) -> anyhow::Result<InstrumentId> {
@@ -458,5 +615,75 @@ mod tests {
         assert_eq!(updated.ask_price, first.ask_price);
         assert_eq!(updated.ask_size, first.ask_size);
         assert_eq!(updated.bid_price.precision, updated.ask_price.precision);
+    }
+
+    #[rstest]
+    fn converts_mbo_snapshot_with_stable_order_ids() {
+        let response = ResponseDepthByOrderSnapshot {
+            symbol: "ESU6".to_string(),
+            exchange: "CME".to_string(),
+            sequence_number: 42,
+            depth_side: DepthTransactionType::Buy as i32,
+            depth_price: 6_000.25,
+            depth_size: vec![3, 5],
+            exchange_order_id: vec!["order-a".to_string(), "order-b".to_string()],
+            rp_code: vec!["0".to_string()],
+            ..Default::default()
+        };
+
+        let deltas = parse_depth_by_order_snapshot(&response, TS_INIT).unwrap();
+        assert_eq!(deltas.deltas.len(), 2);
+        assert!(deltas.deltas.iter().all(|delta| delta.action == BookAction::Add));
+        assert_eq!(deltas.deltas[0].order.order_id, mbo_order_id("order-a").unwrap());
+        assert!(RecordFlag::F_SNAPSHOT.matches(deltas.deltas[0].flags));
+        assert!(RecordFlag::F_LAST.matches(deltas.flags));
+    }
+
+    #[rstest]
+    fn converts_mbo_price_change_to_delete_then_add() {
+        let update = DepthByOrder {
+            symbol: "ESU6".to_string(),
+            exchange: "CME".to_string(),
+            sequence_number: 43,
+            update_type: vec![DepthUpdateType::Change as i32],
+            transaction_type: vec![DepthTransactionType::Sell as i32],
+            depth_price: vec![6_001.00],
+            prev_depth_price: vec![6_000.75],
+            prev_depth_price_flag: vec![true],
+            depth_size: vec![4],
+            exchange_order_id: vec!["order-a".to_string()],
+            ssboe: 1_700_000_000,
+            ..Default::default()
+        };
+
+        let deltas = parse_depth_by_order_update(&update, TS_INIT).unwrap();
+        assert_eq!(deltas.deltas.len(), 2);
+        assert_eq!(deltas.deltas[0].action, BookAction::Delete);
+        assert_eq!(deltas.deltas[1].action, BookAction::Add);
+        assert_eq!(deltas.deltas[0].order.order_id, deltas.deltas[1].order.order_id);
+        assert!(RecordFlag::F_LAST.matches(deltas.flags));
+    }
+
+    #[rstest]
+    fn converts_mbo_cancel_with_exchange_order_identity() {
+        let update = DepthByOrder {
+            symbol: "ESU6".to_string(),
+            exchange: "CME".to_string(),
+            sequence_number: 44,
+            update_type: vec![DepthUpdateType::Delete as i32],
+            transaction_type: vec![DepthTransactionType::Buy as i32],
+            depth_price: vec![6_000.25],
+            depth_size: vec![0],
+            exchange_order_id: vec!["cancelled-order".to_string()],
+            ssboe: 1_700_000_000,
+            ..Default::default()
+        };
+
+        let deltas = parse_depth_by_order_update(&update, TS_INIT).unwrap();
+        assert_eq!(deltas.deltas[0].action, BookAction::Delete);
+        assert_eq!(
+            deltas.deltas[0].order.order_id,
+            mbo_order_id("cancelled-order").unwrap()
+        );
     }
 }

@@ -33,6 +33,8 @@ pub const REJECT_TEMPLATE_ID: i32 = 75;
 pub const FORCED_LOGOUT_TEMPLATE_ID: i32 = 77;
 pub const MARKET_DATA_REQUEST_TEMPLATE_ID: i32 = 100;
 pub const MARKET_DATA_RESPONSE_TEMPLATE_ID: i32 = 101;
+pub const SEARCH_SYMBOLS_REQUEST_TEMPLATE_ID: i32 = 109;
+pub const SEARCH_SYMBOLS_RESPONSE_TEMPLATE_ID: i32 = 110;
 pub const FRONT_MONTH_REQUEST_TEMPLATE_ID: i32 = 113;
 pub const FRONT_MONTH_RESPONSE_TEMPLATE_ID: i32 = 114;
 pub const DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID: i32 = 115;
@@ -41,6 +43,8 @@ pub const DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID: i32 = 117;
 pub const DEPTH_BY_ORDER_UPDATES_RESPONSE_TEMPLATE_ID: i32 = 118;
 pub const DEPTH_BY_ORDER_TEMPLATE_ID: i32 = 160;
 pub const DEPTH_BY_ORDER_END_EVENT_TEMPLATE_ID: i32 = 161;
+pub const LIST_EXCHANGE_PERMISSIONS_REQUEST_TEMPLATE_ID: i32 = 342;
+pub const LIST_EXCHANGE_PERMISSIONS_RESPONSE_TEMPLATE_ID: i32 = 343;
 
 pub const PROTOCOL_TEMPLATE_VERSION: &str = "3.9";
 
@@ -161,6 +165,105 @@ pub enum SubscriptionRequest {
     Unspecified = 0,
     Subscribe = 1,
     Unsubscribe = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum SearchPattern {
+    Unspecified = 0,
+    Equals = 1,
+    Contains = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum SearchInstrumentType {
+    Unspecified = 0,
+    Future = 1,
+    Equity = 2,
+    Option = 3,
+    FutureOption = 4,
+    Spread = 5,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum EntitlementFlag {
+    Unspecified = 0,
+    Enabled = 1,
+    Disabled = 2,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestListExchangePermissions {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, tag = "154220")]
+    pub user: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ResponseListExchangePermissions {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, repeated, tag = "132764")]
+    pub rq_handler_rp_code: Vec<String>,
+    #[prost(string, repeated, tag = "132766")]
+    pub rp_code: Vec<String>,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(string, tag = "153508")]
+    pub level_1_market_data: String,
+    #[prost(string, tag = "153509")]
+    pub level_2_market_data: String,
+    #[prost(enumeration = "EntitlementFlag", tag = "153400")]
+    pub entitlement_flag: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestSearchSymbols {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, tag = "120008")]
+    pub search_text: String,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(string, tag = "100749")]
+    pub product_code: String,
+    #[prost(enumeration = "SearchInstrumentType", tag = "110116")]
+    pub instrument_type: i32,
+    #[prost(enumeration = "SearchPattern", tag = "155008")]
+    pub pattern: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ResponseSearchSymbols {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, repeated, tag = "132764")]
+    pub rq_handler_rp_code: Vec<String>,
+    #[prost(string, repeated, tag = "132766")]
+    pub rp_code: Vec<String>,
+    #[prost(string, tag = "110100")]
+    pub symbol: String,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(string, tag = "100003")]
+    pub symbol_name: String,
+    #[prost(string, tag = "100749")]
+    pub product_code: String,
+    #[prost(string, tag = "110116")]
+    pub instrument_type: String,
+    #[prost(string, tag = "100067")]
+    pub expiration_date: String,
 }
 
 pub mod update_bits {
@@ -543,6 +646,8 @@ pub enum InboundMessage {
     DepthByOrderResponse(ResponseCode),
     DepthByOrder(DepthByOrder),
     DepthByOrderEnd(DepthByOrderEndEvent),
+    ExchangePermission(ResponseListExchangePermissions),
+    SearchSymbol(ResponseSearchSymbols),
     Reject(ResponseCode),
     ForcedLogout,
     Unsupported(i32),
@@ -585,6 +690,12 @@ pub fn decode_inbound(frame: &[u8]) -> anyhow::Result<InboundMessage> {
         }
         DEPTH_BY_ORDER_END_EVENT_TEMPLATE_ID => {
             InboundMessage::DepthByOrderEnd(DepthByOrderEndEvent::decode(payload)?)
+        }
+        LIST_EXCHANGE_PERMISSIONS_RESPONSE_TEMPLATE_ID => InboundMessage::ExchangePermission(
+            ResponseListExchangePermissions::decode(payload)?,
+        ),
+        SEARCH_SYMBOLS_RESPONSE_TEMPLATE_ID => {
+            InboundMessage::SearchSymbol(ResponseSearchSymbols::decode(payload)?)
         }
         REJECT_TEMPLATE_ID => InboundMessage::Reject(ResponseCode::decode(payload)?),
         FORCED_LOGOUT_TEMPLATE_ID => InboundMessage::ForcedLogout,
@@ -669,5 +780,45 @@ mod tests {
         assert_eq!(decoded.sequence_number, 42);
         assert_eq!(decoded.update_type, vec![DepthUpdateType::Delete as i32]);
         assert_eq!(decoded.exchange_order_id, vec!["exchange-order-1"]);
+    }
+
+    #[rstest]
+    fn decodes_exchange_permission_discovery() {
+        let response = ResponseListExchangePermissions {
+            template_id: LIST_EXCHANGE_PERMISSIONS_RESPONSE_TEMPLATE_ID,
+            exchange: "CME".to_string(),
+            level_1_market_data: "1".to_string(),
+            level_2_market_data: "1".to_string(),
+            entitlement_flag: EntitlementFlag::Enabled as i32,
+            ..Default::default()
+        };
+
+        let InboundMessage::ExchangePermission(decoded) =
+            decode_inbound(&encode_frame(&response)).unwrap()
+        else {
+            panic!("Expected exchange-permission response")
+        };
+        assert_eq!(decoded.exchange, "CME");
+        assert_eq!(decoded.entitlement_flag, EntitlementFlag::Enabled as i32);
+    }
+
+    #[rstest]
+    fn decodes_symbol_search_discovery() {
+        let response = ResponseSearchSymbols {
+            template_id: SEARCH_SYMBOLS_RESPONSE_TEMPLATE_ID,
+            symbol: "ESU6".to_string(),
+            exchange: "CME".to_string(),
+            product_code: "ES".to_string(),
+            instrument_type: "Future".to_string(),
+            ..Default::default()
+        };
+
+        let InboundMessage::SearchSymbol(decoded) =
+            decode_inbound(&encode_frame(&response)).unwrap()
+        else {
+            panic!("Expected symbol-search response")
+        };
+        assert_eq!(decoded.symbol, "ESU6");
+        assert_eq!(decoded.product_code, "ES");
     }
 }

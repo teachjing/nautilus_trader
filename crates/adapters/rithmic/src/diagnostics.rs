@@ -39,6 +39,14 @@ pub struct RithmicConnectionProbeResult {
     pub available_systems: Vec<String>,
     /// JSONL file containing credential-safe discovery and connection responses.
     pub diagnostic_log_path: Option<String>,
+    /// Stable JSON catalog containing discovered exchanges and instruments.
+    pub discovery_catalog_path: Option<String>,
+    /// Number of exchanges returned by template 343.
+    pub discovered_exchanges: usize,
+    /// Number of exchanges enabled for this user.
+    pub entitled_exchanges: usize,
+    /// Number of futures instruments returned by template 110.
+    pub discovered_instruments: usize,
     /// Contracts used for the actual Rithmic market-data subscriptions.
     pub resolved_subscriptions: Vec<String>,
     /// Number of native Nautilus trade ticks received.
@@ -147,12 +155,25 @@ pub async fn run_connection_probe(
     );
     let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
     let mbo_probe_enabled = env_flag("RITHMIC_TEST_MBO");
+    let discover_markets = env_flag("RITHMIC_DISCOVER_MARKETS")
+        || env_flag("RITHMIC_DISCOVER_INSTRUMENTS");
+    let discover_instruments = env_flag("RITHMIC_DISCOVER_INSTRUMENTS");
+    let discovery_timeout_secs = std::env::var("RITHMIC_DISCOVERY_TIMEOUT_SECS")
+        .ok()
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid RITHMIC_DISCOVERY_TIMEOUT_SECS: {e}"))?
+        .unwrap_or(120);
+    let catalog_dir = config
+        .diagnostic_log_dir
+        .clone()
+        .unwrap_or_else(|| "target/rithmic-diagnostics".to_string());
     let mbo_depth_price = std::env::var("RITHMIC_MBO_DEPTH_PRICE")
         .ok()
         .map(|value| value.parse::<f64>())
         .transpose()
         .map_err(|e| anyhow::anyhow!("Invalid RITHMIC_MBO_DEPTH_PRICE: {e}"))?;
-    let (session, resolved) = RithmicSession::connect_subscribed(
+    let (mut session, resolved) = RithmicSession::connect_subscribed(
         &config.gateway_url,
         &credentials,
         &subscriptions,
@@ -161,6 +182,23 @@ pub async fn run_connection_probe(
         config.diagnostic_log_dir.as_deref(),
     )
     .await?;
+
+    let discovered_catalog = if discover_markets {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(discovery_timeout_secs),
+                session.discover_catalog(&credentials.user, discover_instruments),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Rithmic catalog discovery timed out after {discovery_timeout_secs}s"
+                )
+            })??,
+        )
+    } else {
+        None
+    };
 
     let mut result = RithmicConnectionProbeResult {
         available_systems: session.available_systems().to_vec(),
@@ -174,6 +212,18 @@ pub async fn run_connection_probe(
         mbo_probe_enabled,
         ..Default::default()
     };
+    if let Some(catalog) = discovered_catalog {
+        let path = std::path::Path::new(&catalog_dir).join("rithmic-discovery.json");
+        catalog.save(&path)?;
+        result.discovery_catalog_path = Some(path.display().to_string());
+        result.discovered_exchanges = catalog.exchanges.len();
+        result.entitled_exchanges = catalog
+            .exchanges
+            .iter()
+            .filter(|exchange| exchange.entitled)
+            .count();
+        result.discovered_instruments = catalog.instruments.len();
+    }
     let mut book_state = OrderBookProbeState::default();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let raw_book_metrics = std::sync::Arc::new(RawOrderBookMetrics::default());
@@ -261,6 +311,10 @@ fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Re
         "status": "observed",
         "details": {
             "order_book_type": result.order_book_type.map(|value| value.to_string()),
+            "discovery_catalog_path": result.discovery_catalog_path,
+            "discovered_exchanges": result.discovered_exchanges,
+            "entitled_exchanges": result.entitled_exchanges,
+            "discovered_instruments": result.discovered_instruments,
             "max_bid_levels": result.max_bid_levels,
             "max_ask_levels": result.max_ask_levels,
             "book_adds": result.book_adds,

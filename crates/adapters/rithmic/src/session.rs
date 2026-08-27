@@ -35,13 +35,17 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    discovery::{RithmicDiscoveryCatalog, RithmicExchangeInfo, RithmicInstrumentInfo},
     flow::{
         LoginCredentials, MarketSubscription, ensure_response_success, heartbeat_interval,
         heartbeat_request,
     },
-    parse::{QuoteState, parse_order_book, parse_quote, parse_trade},
+    parse::{
+        QuoteState, mbo_order_id, parse_depth_by_order_snapshot, parse_depth_by_order_update,
+        parse_order_book, parse_quote, parse_trade,
+    },
     protocol::{
-        FORCED_LOGOUT_TEMPLATE_ID, InboundMessage, LOGOUT_REQUEST_TEMPLATE_ID,
+        EntitlementFlag, FORCED_LOGOUT_TEMPLATE_ID, InboundMessage, LOGOUT_REQUEST_TEMPLATE_ID,
         LOGIN_RESPONSE_TEMPLATE_ID, REJECT_TEMPLATE_ID, RequestLogout, RequestSystemInfo,
         RequestFrontMonthContract, ResponseCode, ResponseFrontMonthContract, ResponseSystemInfo,
         SYSTEM_INFO_REQUEST_TEMPLATE_ID, SYSTEM_INFO_RESPONSE_TEMPLATE_ID, SubscriptionRequest,
@@ -49,6 +53,9 @@ use crate::{
         encode_frame, DepthByOrder, DepthUpdateType, RequestDepthByOrderSnapshot,
         RequestDepthByOrderUpdates, ResponseDepthByOrderSnapshot,
         DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID, DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID,
+        LIST_EXCHANGE_PERMISSIONS_REQUEST_TEMPLATE_ID, RequestListExchangePermissions,
+        RequestSearchSymbols, SEARCH_SYMBOLS_REQUEST_TEMPLATE_ID, SearchInstrumentType,
+        SearchPattern,
     },
 };
 
@@ -518,6 +525,161 @@ impl RithmicSession {
         self.diagnostic_log.as_ref().map(|log| log.path.as_path())
     }
 
+    /// Discovers exchange entitlements and, optionally, futures instruments for each entitled
+    /// exchange on the authenticated ticker-plant session.
+    pub(crate) async fn discover_catalog(
+        &mut self,
+        user: &str,
+        include_instruments: bool,
+    ) -> anyhow::Result<RithmicDiscoveryCatalog> {
+        let request = RequestListExchangePermissions {
+            template_id: LIST_EXCHANGE_PERMISSIONS_REQUEST_TEMPLATE_ID,
+            user_msg: vec!["catalog_exchanges".to_string()],
+            user: user.to_string(),
+        };
+        Self::send_protobuf(&mut self.socket, &request).await?;
+        let mut catalog = RithmicDiscoveryCatalog::default();
+        loop {
+            let response = self.receive_exchange_permission().await?;
+            Self::ensure_handler_codes_succeed(&response.rq_handler_rp_code)?;
+            if !response.exchange.is_empty() {
+                catalog.exchanges.push(RithmicExchangeInfo {
+                    exchange: response.exchange,
+                    level_1_market_data: response.level_1_market_data,
+                    level_2_market_data: response.level_2_market_data,
+                    entitled: response.entitlement_flag == EntitlementFlag::Enabled as i32,
+                });
+            }
+            if !response.rp_code.is_empty() {
+                Self::ensure_codes_succeed(response.template_id, &response.rp_code)?;
+                break;
+            }
+        }
+
+        if include_instruments {
+            let exchanges = catalog
+                .exchanges
+                .iter()
+                .filter(|exchange| exchange.entitled)
+                .map(|exchange| exchange.exchange.clone())
+                .collect::<Vec<_>>();
+            for exchange in exchanges {
+                catalog.instruments.extend(self.search_futures(&exchange).await?);
+            }
+            catalog.instruments.sort_by(|a, b| {
+                (&a.exchange, &a.symbol).cmp(&(&b.exchange, &b.symbol))
+            });
+            catalog.instruments.dedup_by(|a, b| {
+                a.exchange == b.exchange && a.symbol == b.symbol
+            });
+        }
+        catalog.exchanges.sort_by(|a, b| a.exchange.cmp(&b.exchange));
+        if let Some(log) = &self.diagnostic_log {
+            log.record(
+                "market_instrument_discovery",
+                "success",
+                serde_json::json!({
+                    "exchanges": catalog.exchanges.len(),
+                    "entitled_exchanges": catalog.exchanges.iter().filter(|value| value.entitled).count(),
+                    "instruments": catalog.instruments.len(),
+                    "instrument_search_enabled": include_instruments,
+                }),
+            );
+        }
+        Ok(catalog)
+    }
+
+    async fn search_futures(&mut self, exchange: &str) -> anyhow::Result<Vec<RithmicInstrumentInfo>> {
+        let request = RequestSearchSymbols {
+            template_id: SEARCH_SYMBOLS_REQUEST_TEMPLATE_ID,
+            user_msg: vec![format!("catalog_instruments:{exchange}")],
+            search_text: String::new(),
+            exchange: exchange.to_string(),
+            product_code: String::new(),
+            instrument_type: SearchInstrumentType::Future as i32,
+            pattern: SearchPattern::Contains as i32,
+        };
+        Self::send_protobuf(&mut self.socket, &request).await?;
+        let mut instruments = Vec::new();
+        loop {
+            let response = self.receive_search_symbol().await?;
+            Self::ensure_handler_codes_succeed(&response.rq_handler_rp_code)?;
+            if !response.symbol.is_empty() {
+                instruments.push(RithmicInstrumentInfo {
+                    symbol: response.symbol,
+                    exchange: response.exchange,
+                    symbol_name: response.symbol_name,
+                    product_code: response.product_code,
+                    instrument_type: response.instrument_type,
+                    expiration_date: response.expiration_date,
+                });
+            }
+            if !response.rp_code.is_empty() {
+                // Code 7 means this exchange returned no matching futures, not a session failure.
+                if response.rp_code.first().is_some_and(|code| code == "7") {
+                    break;
+                }
+                Self::ensure_codes_succeed(response.template_id, &response.rp_code)?;
+                break;
+            }
+        }
+        Ok(instruments)
+    }
+
+    async fn receive_exchange_permission(
+        &mut self,
+    ) -> anyhow::Result<crate::protocol::ResponseListExchangePermissions> {
+        loop {
+            match self.receive_discovery_message().await? {
+                InboundMessage::ExchangePermission(response) => return Ok(response),
+                _ => continue,
+            }
+        }
+    }
+
+    async fn receive_search_symbol(
+        &mut self,
+    ) -> anyhow::Result<crate::protocol::ResponseSearchSymbols> {
+        loop {
+            match self.receive_discovery_message().await? {
+                InboundMessage::SearchSymbol(response) => return Ok(response),
+                _ => continue,
+            }
+        }
+    }
+
+    async fn receive_discovery_message(&mut self) -> anyhow::Result<InboundMessage> {
+        while let Some(message) = self.socket.next().await {
+            match message? {
+                WebSocketMessage::Binary(data) => {
+                    let message = decode_inbound(&data)?;
+                    match &message {
+                        InboundMessage::Reject(response) => {
+                            Self::ensure_codes_succeed(REJECT_TEMPLATE_ID, &response.rp_code)?;
+                        }
+                        InboundMessage::ForcedLogout => anyhow::bail!("Rithmic forced logout received"),
+                        _ => return Ok(message),
+                    }
+                }
+                WebSocketMessage::Ping(data) => {
+                    self.socket.send(WebSocketMessage::Pong(data)).await?;
+                }
+                WebSocketMessage::Close(frame) => {
+                    anyhow::bail!("Rithmic WebSocket closed during catalog discovery: {frame:?}")
+                }
+                WebSocketMessage::Text(_) | WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
+            }
+        }
+        anyhow::bail!("Rithmic WebSocket ended during catalog discovery")
+    }
+
+    fn ensure_handler_codes_succeed(rp_code: &[String]) -> anyhow::Result<()> {
+        if rp_code.is_empty() {
+            return Ok(());
+        }
+        Self::ensure_codes_succeed(0, rp_code)
+    }
+
     pub(crate) async fn subscribe(
         &mut self,
         subscription: &MarketSubscription,
@@ -548,6 +710,7 @@ impl RithmicSession {
         let mut book_sequence = 0_u64;
         let mut quote_cache = HashMap::<InstrumentId, QuoteState>::new();
         let mut depth_by_order_requests = HashMap::<InstrumentId, (MarketSubscription, f64)>::new();
+        let mut mbo_order_ids = HashMap::<u64, String>::new();
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await;
 
@@ -594,6 +757,7 @@ impl RithmicSession {
                         probe_depth_by_order,
                         depth_by_order_price,
                         &mut depth_by_order_requests,
+                        &mut mbo_order_ids,
                     ).await?;
                 }
             }
@@ -629,6 +793,7 @@ impl RithmicSession {
             InstrumentId,
             (MarketSubscription, f64),
         >,
+        mbo_order_ids: &mut HashMap<u64, String>,
     ) -> anyhow::Result<()> {
         match message {
             WebSocketMessage::Binary(data) => match decode_inbound(&data)? {
@@ -768,6 +933,16 @@ impl RithmicSession {
                             }),
                         );
                     }
+                    Self::validate_mbo_order_ids(&response.exchange_order_id, mbo_order_ids)?;
+                    match parse_depth_by_order_snapshot(&response, clock.get_time_ns()) {
+                        Ok(deltas) => {
+                            Self::send_data(data_sender, Data::Deltas(Box::new(deltas)));
+                        }
+                        Err(e) if response.exchange_order_id.is_empty() => {
+                            log::debug!("Ignoring empty Rithmic MBO snapshot response: {e}");
+                        }
+                        Err(e) => log::warn!("Ignoring invalid Rithmic MBO snapshot: {e}"),
+                    }
                 }
                 InboundMessage::DepthByOrderResponse(response) => {
                     let accepted = response.rp_code.len() == 1 && response.rp_code[0] == "0";
@@ -802,6 +977,14 @@ impl RithmicSession {
                     if let Some(metrics) = raw_book_metrics {
                         metrics.observe_mbo_update(&update);
                     }
+                    Self::validate_mbo_order_ids(&update.exchange_order_id, mbo_order_ids)?;
+                    match parse_depth_by_order_update(&update, clock.get_time_ns()) {
+                        Ok(deltas) => {
+                            Self::send_data(data_sender, Data::Deltas(Box::new(deltas)));
+                        }
+                        Err(e) => log::warn!("Ignoring invalid Rithmic MBO update: {e}"),
+                    }
+                    Self::release_deleted_mbo_order_ids(&update, mbo_order_ids);
                 }
                 InboundMessage::DepthByOrderEnd(_) => {
                     if let Some(metrics) = raw_book_metrics {
@@ -856,6 +1039,42 @@ impl RithmicSession {
             subscription.symbol
         );
         Ok(())
+    }
+
+    fn validate_mbo_order_ids(
+        exchange_order_ids: &[String],
+        known: &mut HashMap<u64, String>,
+    ) -> anyhow::Result<()> {
+        for exchange_order_id in exchange_order_ids {
+            let order_id = mbo_order_id(exchange_order_id)?;
+            if let Some(existing) = known.get(&order_id) {
+                anyhow::ensure!(
+                    existing == exchange_order_id,
+                    "Rithmic MBO order ID hash collision between '{existing}' and '{exchange_order_id}'"
+                );
+            } else {
+                known.insert(order_id, exchange_order_id.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn release_deleted_mbo_order_ids(
+        update: &DepthByOrder,
+        known: &mut HashMap<u64, String>,
+    ) {
+        for (update_type, exchange_order_id) in
+            update.update_type.iter().zip(&update.exchange_order_id)
+        {
+            if matches!(
+                DepthUpdateType::try_from(*update_type),
+                Ok(DepthUpdateType::Delete)
+            ) {
+                if let Ok(order_id) = mbo_order_id(exchange_order_id) {
+                    known.remove(&order_id);
+                }
+            }
+        }
     }
 
     async fn unsubscribe_depth_by_order(
@@ -926,6 +1145,8 @@ impl RithmicSession {
             InboundMessage::DepthByOrderResponse(response) => Some(response.template_id),
             InboundMessage::DepthByOrder(response) => Some(response.template_id),
             InboundMessage::DepthByOrderEnd(response) => Some(response.template_id),
+            InboundMessage::ExchangePermission(response) => Some(response.template_id),
+            InboundMessage::SearchSymbol(response) => Some(response.template_id),
             InboundMessage::Unsupported(template_id) => Some(*template_id),
             InboundMessage::ForcedLogout => Some(FORCED_LOGOUT_TEMPLATE_ID),
         }

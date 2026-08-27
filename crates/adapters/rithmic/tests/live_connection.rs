@@ -48,6 +48,12 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
     let require_mbo = std::env::var("RITHMIC_REQUIRE_MBO").is_ok_and(|value| {
         matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
     });
+    let discover_markets = std::env::var("RITHMIC_DISCOVER_MARKETS").is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    });
+    let discover_instruments = std::env::var("RITHMIC_DISCOVER_INSTRUMENTS").is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    });
 
     let result = run_connection_probe(config, Duration::from_secs(duration_secs))
         .await
@@ -64,6 +70,14 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
         assert_eq!(result.order_book_type, Some(BookType::L3_MBO));
         assert!(result.mbo_subscription_accepted);
         assert!(result.mbo_capable);
+    }
+    if discover_markets || discover_instruments {
+        assert!(result.discovery_catalog_path.is_some());
+        assert!(result.discovered_exchanges > 0);
+        assert!(result.entitled_exchanges > 0);
+    }
+    if discover_instruments {
+        assert!(result.discovered_instruments > 0);
     }
     assert!(
         result.total_events() > 0,

@@ -20,6 +20,7 @@
 pub mod config;
 pub mod data;
 pub mod diagnostics;
+pub mod discovery;
 pub mod factories;
 pub mod flow;
 pub mod parse;
