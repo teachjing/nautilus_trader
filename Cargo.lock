@@ -6738,6 +6738,7 @@ dependencies = [
  "nautilus-polymarket",
  "nautilus-portfolio",
  "nautilus-risk",
+ "nautilus-rithmic",
  "nautilus-sandbox",
  "nautilus-serialization",
  "nautilus-system",
@@ -6768,6 +6769,32 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "ustr",
+]
+
+[[package]]
+name = "nautilus-rithmic"
+version = "0.63.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "futures-util",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-cryptography",
+ "nautilus-model",
+ "nautilus-system",
+ "prost 0.13.5",
+ "pyo3",
+ "pyo3-stub-gen",
+ "rstest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "zeroize",
 ]
 
 [[package]]
