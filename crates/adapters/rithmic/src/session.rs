@@ -63,7 +63,7 @@ use crate::{
     },
 };
 use crate::transport::{
-    PingManager, WEBSOCKET_PING_INTERVAL, WEBSOCKET_PING_TIMEOUT, close_with_timeout,
+    LivenessWatchdog, WEBSOCKET_PING_INTERVAL, WEBSOCKET_PING_TIMEOUT, close_with_timeout,
     send_with_timeout,
 };
 
@@ -300,6 +300,16 @@ impl ReconnectBackoff {
         let delay = self.next;
         self.next = self.next.saturating_add(self.initial).min(self.maximum);
         delay
+    }
+
+    pub(crate) fn next_delay_with_jitter(&mut self) -> Duration {
+        let delay = self.next_delay();
+        let sample = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let percentage = 75 + (sample % 51);
+        delay.mul_f64(f64::from(percentage) / 100.0)
     }
 
     pub(crate) fn reset(&mut self) {
@@ -1141,7 +1151,12 @@ impl RithmicSession {
     ) -> anyhow::Result<()> {
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
         let mut websocket_ping = tokio::time::interval(WEBSOCKET_PING_INTERVAL);
-        let mut ping_manager = PingManager::new(WEBSOCKET_PING_TIMEOUT);
+        let mut heartbeat_watchdog = LivenessWatchdog::new(
+            "application heartbeat",
+            self.heartbeat_interval.saturating_mul(2),
+        );
+        let mut ping_watchdog =
+            LivenessWatchdog::new("WebSocket ping", WEBSOCKET_PING_TIMEOUT);
         let mut book_sequence = 0_u64;
         let mut quote_cache = HashMap::<InstrumentId, QuoteState>::new();
         let mut depth_by_order_requests = HashMap::<InstrumentId, (MarketSubscription, f64)>::new();
@@ -1179,15 +1194,22 @@ impl RithmicSession {
                 () = cancel.cancelled() => break,
                 _ = heartbeat.tick() => {
                     Self::send_protobuf(&mut self.socket, &heartbeat_request(0, 0)).await?;
+                    heartbeat_watchdog.sent();
                 }
                 _ = websocket_ping.tick() => {
                     send_with_timeout(
                         &mut self.socket,
                         WebSocketMessage::Ping(Vec::new().into()),
                     ).await?;
-                    ping_manager.sent();
+                    ping_watchdog.sent();
                 }
-                () = ping_manager.timed_out() => {
+                () = heartbeat_watchdog.timed_out() => {
+                    anyhow::bail!(
+                        "Rithmic application heartbeat response timed out after {:?}",
+                        self.heartbeat_interval.saturating_mul(2),
+                    )
+                }
+                () = ping_watchdog.timed_out() => {
                     anyhow::bail!(
                         "Rithmic WebSocket pong timed out after {WEBSOCKET_PING_TIMEOUT:?}"
                     )
@@ -1198,7 +1220,7 @@ impl RithmicSession {
                     };
                     let message = message?;
                     if matches!(&message, WebSocketMessage::Pong(_)) {
-                        ping_manager.received();
+                        ping_watchdog.received();
                     }
                     self.handle_websocket_message(
                         message,
@@ -1211,6 +1233,7 @@ impl RithmicSession {
                         depth_by_order_price,
                         &mut depth_by_order_requests,
                         &mut mbo_order_ids,
+                        &mut heartbeat_watchdog,
                     ).await?;
                 }
             }
@@ -1247,6 +1270,7 @@ impl RithmicSession {
             (MarketSubscription, f64),
         >,
         mbo_order_ids: &mut HashMap<u64, String>,
+        heartbeat_watchdog: &mut LivenessWatchdog,
     ) -> anyhow::Result<()> {
         match message {
             WebSocketMessage::Binary(data) => match decode_inbound(&data)? {
@@ -1274,6 +1298,10 @@ impl RithmicSession {
                 }
                 InboundMessage::ForcedLogout => {
                     anyhow::bail!("Rithmic forced logout received")
+                }
+                InboundMessage::Heartbeat(response) => {
+                    Self::ensure_codes_succeed(response.template_id, &response.rp_code)?;
+                    heartbeat_watchdog.received();
                 }
                 InboundMessage::MarketDataResponse(response) => {
                     if let Some(log) = &self.diagnostic_log {
@@ -1754,6 +1782,18 @@ mod tests {
         backoff.reset();
 
         assert_eq!(backoff.next_delay(), Duration::from_secs(10));
+    }
+
+    #[rstest]
+    fn reconnect_backoff_jitter_stays_within_bounds() {
+        let initial = Duration::from_secs(10);
+        let mut backoff = ReconnectBackoff::new(initial, Duration::from_secs(30)).unwrap();
+
+        let delay = backoff.next_delay_with_jitter();
+
+        assert!(delay >= initial.mul_f64(0.75));
+        assert!(delay <= initial.mul_f64(1.25));
+        assert_eq!(backoff.next, Duration::from_secs(20));
     }
 
     #[rstest]

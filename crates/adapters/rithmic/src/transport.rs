@@ -3,6 +3,8 @@
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
 // -------------------------------------------------------------------------------------------------
 
 //! Bounded WebSocket I/O and connection liveness supervision.
@@ -22,22 +24,29 @@ pub(crate) const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const WEBSOCKET_PING_TIMEOUT: Duration = Duration::from_secs(50);
 
 #[derive(Debug)]
-pub(crate) struct PingManager {
+pub(crate) struct LivenessWatchdog {
+    label: &'static str,
     pending_since: Option<Instant>,
     timeout: Duration,
 }
 
-impl PingManager {
-    pub(crate) const fn new(timeout: Duration) -> Self {
+impl LivenessWatchdog {
+    pub(crate) const fn new(label: &'static str, timeout: Duration) -> Self {
         Self {
+            label,
             pending_since: None,
             timeout,
         }
     }
 
     pub(crate) fn sent(&mut self) {
-        if self.pending_since.replace(Instant::now()).is_some() {
-            log::warn!("Sent a new Rithmic WebSocket ping before receiving the previous pong");
+        if self.pending_since.is_none() {
+            self.pending_since = Some(Instant::now());
+        } else {
+            log::warn!(
+                "Sent a new Rithmic {} before receiving the previous response",
+                self.label,
+            );
         }
     }
 
@@ -87,19 +96,30 @@ where
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
-    fn ping_manager_starts_idle() {
-        let manager = PingManager::new(Duration::from_secs(1));
+    #[rstest]
+    fn liveness_watchdog_starts_idle() {
+        let manager = LivenessWatchdog::new("test", Duration::from_secs(1));
         assert!(manager.pending_since.is_none());
     }
 
-    #[test]
-    fn pong_clears_pending_ping() {
-        let mut manager = PingManager::new(Duration::from_secs(1));
+    #[rstest]
+    fn response_clears_pending_request() {
+        let mut manager = LivenessWatchdog::new("test", Duration::from_secs(1));
         manager.sent();
         manager.received();
         assert!(manager.pending_since.is_none());
+    }
+
+    #[rstest]
+    fn repeated_send_preserves_original_deadline() {
+        let mut manager = LivenessWatchdog::new("test", Duration::from_secs(1));
+        manager.sent();
+        let pending_since = manager.pending_since;
+        manager.sent();
+        assert_eq!(manager.pending_since, pending_since);
     }
 }

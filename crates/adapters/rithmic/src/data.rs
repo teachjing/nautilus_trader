@@ -11,7 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use nautilus_common::{
@@ -41,6 +41,8 @@ use crate::{
     protocol::update_bits,
     session::{ReconnectBackoff, RithmicSession},
 };
+
+const STABLE_SESSION_THRESHOLD: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct HistoryRequest {
@@ -383,6 +385,7 @@ impl DataClient for RithmicDataClient {
                 let (session, resolved_subscriptions) = active_session
                     .take()
                     .expect("Rithmic session available before run");
+                let session_started = Instant::now();
                 let result = session
                     .run(
                         resolved_subscriptions,
@@ -394,6 +397,9 @@ impl DataClient for RithmicDataClient {
                         None,
                     )
                     .await;
+                if session_started.elapsed() >= STABLE_SESSION_THRESHOLD {
+                    backoff.reset();
+                }
                 connected.store(false, Ordering::Release);
                 if cancel.is_cancelled() {
                     break;
@@ -403,7 +409,7 @@ impl DataClient for RithmicDataClient {
                 }
 
                 loop {
-                    let delay = backoff.next_delay();
+                    let delay = backoff.next_delay_with_jitter();
                     log::info!("Reconnecting Rithmic ticker plant in {delay:?}");
                     tokio::select! {
                         () = cancel.cancelled() => break,
@@ -425,7 +431,6 @@ impl DataClient for RithmicDataClient {
                     {
                         Ok((session, resolved_subscriptions)) => {
                             active_session = Some((session, resolved_subscriptions));
-                            backoff.reset();
                             connected.store(true, Ordering::Release);
                             log::info!("Rithmic ticker plant reconnected and resubscribed");
                             break;
