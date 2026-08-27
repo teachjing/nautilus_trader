@@ -21,6 +21,7 @@ pub mod config;
 pub mod data;
 pub mod factories;
 pub mod flow;
+pub mod parse;
 pub mod protocol;
 
 mod session;

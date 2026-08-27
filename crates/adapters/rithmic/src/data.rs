@@ -11,8 +11,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use nautilus_common::clients::DataClient;
-use nautilus_common::live::get_runtime;
+use nautilus_common::{
+    clients::DataClient,
+    live::{get_runtime, runner::get_data_event_sender},
+    messages::DataEvent,
+};
+use nautilus_core::time::{AtomicTime, get_atomic_clock_realtime};
 use nautilus_model::identifiers::{ClientId, Venue};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -33,6 +37,8 @@ pub struct RithmicDataClient {
     connected: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
     session_task: Option<JoinHandle<()>>,
+    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    clock: &'static AtomicTime,
 }
 
 impl RithmicDataClient {
@@ -58,6 +64,8 @@ impl RithmicDataClient {
             connected: Arc::new(AtomicBool::new(false)),
             cancellation_token: CancellationToken::new(),
             session_task: None,
+            data_sender: get_data_event_sender(),
+            clock: get_atomic_clock_realtime(),
         })
     }
 
@@ -179,9 +187,14 @@ impl DataClient for RithmicDataClient {
         }
         let cancel = self.cancellation_token.clone();
         let connected = Arc::clone(&self.connected);
+        let data_sender = self.data_sender.clone();
+        let clock = self.clock;
         connected.store(true, Ordering::Release);
         self.session_task = Some(get_runtime().spawn(async move {
-            if let Err(error) = session.run(subscriptions, cancel).await {
+            if let Err(error) = session
+                .run(subscriptions, data_sender, clock, cancel)
+                .await
+            {
                 log::error!("Rithmic session stopped: {error:#}");
             }
             connected.store(false, Ordering::Release);

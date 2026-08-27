@@ -163,6 +163,20 @@ pub mod update_bits {
     pub const ORDER_BOOK: u32 = 4;
 }
 
+pub mod trade_presence_bits {
+    pub const LAST_TRADE: u32 = 1;
+}
+
+pub mod quote_presence_bits {
+    pub const BID: u32 = 1;
+    pub const ASK: u32 = 2;
+}
+
+pub mod book_presence_bits {
+    pub const BID: u32 = 1;
+    pub const ASK: u32 = 2;
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct ResponseCode {
     #[prost(int32, tag = "154467")]

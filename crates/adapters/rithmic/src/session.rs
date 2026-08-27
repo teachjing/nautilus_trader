@@ -8,9 +8,12 @@
 
 //! Rithmic ticker-plant WebSocket session.
 
-use std::{fmt::Debug, time::Duration};
+use std::{collections::HashMap, fmt::Debug, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
+use nautilus_common::messages::DataEvent;
+use nautilus_core::time::AtomicTime;
+use nautilus_model::{data::Data, identifiers::InstrumentId};
 use prost::Message as ProstMessage;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -24,6 +27,7 @@ use crate::{
         LoginCredentials, MarketSubscription, ensure_response_success, heartbeat_interval,
         heartbeat_request,
     },
+    parse::{QuoteState, parse_order_book, parse_quote, parse_trade},
     protocol::{
         FORCED_LOGOUT_TEMPLATE_ID, InboundMessage, LOGOUT_REQUEST_TEMPLATE_ID,
         LOGIN_RESPONSE_TEMPLATE_ID, REJECT_TEMPLATE_ID, RequestLogout, RequestSystemInfo,
@@ -114,9 +118,13 @@ impl RithmicSession {
     pub(crate) async fn run(
         mut self,
         subscriptions: Vec<MarketSubscription>,
+        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        clock: &'static AtomicTime,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
+        let mut book_sequence = 0_u64;
+        let mut quote_cache = HashMap::<InstrumentId, QuoteState>::new();
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await;
 
@@ -131,7 +139,13 @@ impl RithmicSession {
                     let Some(message) = message else {
                         anyhow::bail!("Rithmic WebSocket stream ended")
                     };
-                    self.handle_websocket_message(message?).await?;
+                    self.handle_websocket_message(
+                        message?,
+                        &data_sender,
+                        clock,
+                        &mut book_sequence,
+                        &mut quote_cache,
+                    ).await?;
                 }
             }
         }
@@ -151,6 +165,10 @@ impl RithmicSession {
     async fn handle_websocket_message(
         &mut self,
         message: WebSocketMessage,
+        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        clock: &AtomicTime,
+        book_sequence: &mut u64,
+        quote_cache: &mut HashMap<InstrumentId, QuoteState>,
     ) -> anyhow::Result<()> {
         match message {
             WebSocketMessage::Binary(data) => match decode_inbound(&data)? {
@@ -165,30 +183,36 @@ impl RithmicSession {
                     log::debug!("Rithmic market-data subscription accepted");
                 }
                 InboundMessage::LastTrade(update) => {
-                    log::trace!(
-                        "Rithmic trade {}.{} {} @ {}",
-                        update.symbol,
-                        update.exchange,
-                        update.trade_size,
-                        update.trade_price
-                    );
+                    match parse_trade(&update, clock.get_time_ns()) {
+                        Ok(trade) => Self::send_data(data_sender, Data::Trade(trade)),
+                        Err(error) => log::debug!("Ignoring Rithmic trade update: {error}"),
+                    }
                 }
                 InboundMessage::BestBidOffer(update) => {
-                    log::trace!(
-                        "Rithmic BBO {}.{} {} x {}",
-                        update.symbol,
-                        update.exchange,
-                        update.bid_price,
-                        update.ask_price
+                    let instrument_id = InstrumentId::from(
+                        format!("{}.{}", update.symbol, update.exchange).as_str(),
                     );
+                    let state = quote_cache.entry(instrument_id).or_default();
+                    match parse_quote(&update, state, clock.get_time_ns()) {
+                        Ok(Some(quote)) => Self::send_data(data_sender, Data::Quote(quote)),
+                        Ok(None) => {}
+                        Err(error) => log::warn!("Ignoring invalid Rithmic BBO update: {error}"),
+                    }
                 }
                 InboundMessage::OrderBook(update) => {
-                    log::trace!(
-                        "Rithmic book {}.{} type={}",
-                        update.symbol,
-                        update.exchange,
-                        update.update_type
-                    );
+                    *book_sequence = book_sequence.saturating_add(1);
+                    match parse_order_book(
+                        &update,
+                        *book_sequence,
+                        clock.get_time_ns(),
+                    ) {
+                        Ok(deltas) => {
+                            Self::send_data(data_sender, Data::Deltas(Box::new(deltas)));
+                        }
+                        Err(error) => {
+                            log::warn!("Ignoring invalid Rithmic order-book update: {error}");
+                        }
+                    }
                 }
                 InboundMessage::Unsupported(template_id) => {
                     log::debug!("Ignoring unsupported Rithmic template {template_id}");
@@ -277,5 +301,14 @@ impl RithmicSession {
             ..Default::default()
         };
         ensure_response_success(&response)
+    }
+
+    fn send_data(
+        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data: Data,
+    ) {
+        if let Err(error) = sender.send(DataEvent::Data(data)) {
+            log::error!("Failed to emit Rithmic data event: {error}");
+        }
     }
 }
