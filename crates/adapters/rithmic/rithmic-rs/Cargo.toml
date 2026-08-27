@@ -1,0 +1,36 @@
+[package]
+name = "rithmic-rs"
+version = "3.1.0"
+description = "Rust client for the Rithmic R | Protocol API to build algo trading systems"
+license = "MIT OR Apache-2.0"
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/pbeets/rithmic-rs"
+documentation = "https://docs.rs/rithmic-rs"
+readme = "README.md"
+keywords = ["trading", "rithmic", "algotrading", "algorithmic-trading", "automated-trading"]
+categories = ["api-bindings", "finance"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+futures-util = "0.3"
+prost = "0.14.3"
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+dotenvy = "0.15.7"
+prost-build = "0.14.3"
+temp-env = "0.3"
+tokio = { version = "1.50.0", features = ["test-util"] }
+tracing-subscriber = "0.3.23"
