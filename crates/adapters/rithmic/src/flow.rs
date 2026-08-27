@@ -90,6 +90,20 @@ impl Debug for LoginCredentials {
 impl LoginCredentials {
     #[must_use]
     pub fn ticker_plant_request(&self) -> RequestLogin {
+        self.plant_request(InfrastructureType::TickerPlant)
+    }
+
+    #[must_use]
+    pub fn order_plant_request(&self) -> RequestLogin {
+        self.plant_request(InfrastructureType::OrderPlant)
+    }
+
+    #[must_use]
+    pub fn history_plant_request(&self) -> RequestLogin {
+        self.plant_request(InfrastructureType::HistoryPlant)
+    }
+
+    fn plant_request(&self, infrastructure: InfrastructureType) -> RequestLogin {
         RequestLogin {
             template_id: LOGIN_REQUEST_TEMPLATE_ID,
             template_version: PROTOCOL_TEMPLATE_VERSION.to_string(),
@@ -98,7 +112,7 @@ impl LoginCredentials {
             app_name: self.app_name.clone(),
             app_version: self.app_version.clone(),
             system_name: self.system_name.clone(),
-            infra_type: InfrastructureType::TickerPlant as i32,
+            infra_type: infrastructure as i32,
             aggregated_quotes: self.aggregated_quotes,
             ..Default::default()
         }
@@ -152,19 +166,27 @@ mod tests {
 
     #[rstest]
     fn ticker_login_uses_required_protocol_fields() {
-        let request = LoginCredentials {
+        let credentials = LoginCredentials {
             user: "user".to_string(),
             password: "secret".to_string(),
             system_name: "Rithmic Paper Trading".to_string(),
             app_name: "NautilusTrader".to_string(),
             app_version: "2.0".to_string(),
             aggregated_quotes: false,
-        }
-        .ticker_plant_request();
+        };
+        let request = credentials.ticker_plant_request();
 
         assert_eq!(request.template_id, LOGIN_REQUEST_TEMPLATE_ID);
         assert_eq!(request.template_version, PROTOCOL_TEMPLATE_VERSION);
         assert_eq!(request.infra_type, InfrastructureType::TickerPlant as i32);
+        assert_eq!(
+            credentials.order_plant_request().infra_type,
+            InfrastructureType::OrderPlant as i32
+        );
+        assert_eq!(
+            credentials.history_plant_request().infra_type,
+            InfrastructureType::HistoryPlant as i32
+        );
     }
 
     #[rstest]

@@ -47,6 +47,20 @@ pub struct RithmicConnectionProbeResult {
     pub entitled_exchanges: usize,
     /// Number of futures instruments returned by template 110.
     pub discovered_instruments: usize,
+    /// Whether the opt-in concurrent plant capacity probe ran.
+    pub plant_capacity_probe_enabled: bool,
+    /// Whether an Order Plant login succeeded while Ticker Plant remained connected.
+    pub order_with_ticker_connected: bool,
+    /// Whether a History Plant login succeeded while both Ticker and Order were connected.
+    pub history_with_ticker_and_order_connected: bool,
+    /// Whether a History Plant login succeeded while only Ticker remained connected.
+    pub history_with_ticker_only_connected: bool,
+    /// Credential-safe Order Plant connection error, when rejected.
+    pub order_connection_error: Option<String>,
+    /// Credential-safe History Plant connection error with Order Plant held open.
+    pub history_with_order_connection_error: Option<String>,
+    /// Credential-safe History Plant connection error with only Ticker Plant held open.
+    pub history_ticker_only_connection_error: Option<String>,
     /// Contracts used for the actual Rithmic market-data subscriptions.
     pub resolved_subscriptions: Vec<String>,
     /// Number of native Nautilus trade ticks received.
@@ -123,6 +137,45 @@ pub struct RithmicConnectionProbeResult {
     pub mbo_capable: bool,
 }
 
+/// Result of testing simultaneous authenticated Rithmic infrastructure-plant sockets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RithmicPlantCapacityProbeResult {
+    pub ticker_connected: bool,
+    pub order_with_ticker_connected: bool,
+    pub history_with_ticker_and_order_connected: bool,
+    pub history_with_ticker_only_connected: bool,
+    pub order_error: Option<String>,
+    pub history_with_order_error: Option<String>,
+    pub history_ticker_only_error: Option<String>,
+}
+
+/// Tests the account's concurrent Ticker, Order, and History Plant connection capacity.
+///
+/// # Errors
+///
+/// Returns an error if system discovery or the baseline Ticker Plant login fails.
+pub async fn run_plant_capacity_probe(
+    config: &RithmicDataClientConfig,
+) -> anyhow::Result<RithmicPlantCapacityProbeResult> {
+    let credentials = credentials(config)?;
+    let capacity = RithmicSession::probe_plant_connection_capacity(
+        &config.gateway_url,
+        &credentials,
+        config.diagnostic_log_dir.as_deref(),
+    )
+    .await?;
+    Ok(RithmicPlantCapacityProbeResult {
+        ticker_connected: capacity.ticker_connected,
+        order_with_ticker_connected: capacity.order_with_ticker_connected,
+        history_with_ticker_and_order_connected: capacity
+            .history_with_ticker_and_order_connected,
+        history_with_ticker_only_connected: capacity.history_with_ticker_only_connected,
+        order_error: capacity.order_error,
+        history_with_order_error: capacity.history_with_order_error,
+        history_ticker_only_error: capacity.history_ticker_only_error,
+    })
+}
+
 #[derive(Default)]
 struct OrderBookProbeState {
     levels: HashSet<(InstrumentId, OrderSide, Price)>,
@@ -158,6 +211,7 @@ pub async fn run_connection_probe(
     let discover_markets = env_flag("RITHMIC_DISCOVER_MARKETS")
         || env_flag("RITHMIC_DISCOVER_INSTRUMENTS");
     let discover_instruments = env_flag("RITHMIC_DISCOVER_INSTRUMENTS");
+    let plant_capacity_probe_enabled = env_flag("RITHMIC_TEST_PLANT_CAPACITY");
     let discovery_timeout_secs = std::env::var("RITHMIC_DISCOVERY_TIMEOUT_SECS")
         .ok()
         .map(|value| value.parse::<u64>())
@@ -173,21 +227,16 @@ pub async fn run_connection_probe(
         .map(|value| value.parse::<f64>())
         .transpose()
         .map_err(|e| anyhow::anyhow!("Invalid RITHMIC_MBO_DEPTH_PRICE: {e}"))?;
-    let (mut session, resolved) = RithmicSession::connect_subscribed(
-        &config.gateway_url,
-        &credentials,
-        &subscriptions,
-        connect_timeout,
-        config.front_month_fallback.as_deref(),
-        config.diagnostic_log_dir.as_deref(),
-    )
-    .await?;
-
     let discovered_catalog = if discover_markets {
         Some(
             tokio::time::timeout(
                 Duration::from_secs(discovery_timeout_secs),
-                session.discover_catalog(&credentials.user, discover_instruments),
+                RithmicSession::discover_catalog_sequential(
+                    &config.gateway_url,
+                    &credentials,
+                    discover_instruments,
+                    config.diagnostic_log_dir.as_deref(),
+                ),
             )
             .await
             .map_err(|_| {
@@ -200,6 +249,22 @@ pub async fn run_connection_probe(
         None
     };
 
+    let plant_capacity = if plant_capacity_probe_enabled {
+        Some(run_plant_capacity_probe(&config).await?)
+    } else {
+        None
+    };
+
+    let (session, resolved) = RithmicSession::connect_subscribed(
+        &config.gateway_url,
+        &credentials,
+        &subscriptions,
+        connect_timeout,
+        config.front_month_fallback.as_deref(),
+        config.diagnostic_log_dir.as_deref(),
+    )
+    .await?;
+
     let mut result = RithmicConnectionProbeResult {
         available_systems: session.available_systems().to_vec(),
         diagnostic_log_path: session
@@ -210,8 +275,18 @@ pub async fn run_connection_probe(
             .map(|subscription| format!("{}.{}", subscription.exchange, subscription.symbol))
             .collect(),
         mbo_probe_enabled,
+        plant_capacity_probe_enabled,
         ..Default::default()
     };
+    if let Some(capacity) = plant_capacity {
+        result.order_with_ticker_connected = capacity.order_with_ticker_connected;
+        result.history_with_ticker_and_order_connected =
+            capacity.history_with_ticker_and_order_connected;
+        result.history_with_ticker_only_connected = capacity.history_with_ticker_only_connected;
+        result.order_connection_error = capacity.order_error;
+        result.history_with_order_connection_error = capacity.history_with_order_error;
+        result.history_ticker_only_connection_error = capacity.history_ticker_only_error;
+    }
     if let Some(catalog) = discovered_catalog {
         let path = std::path::Path::new(&catalog_dir).join("rithmic-discovery.json");
         catalog.save(&path)?;
@@ -315,6 +390,13 @@ fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Re
             "discovered_exchanges": result.discovered_exchanges,
             "entitled_exchanges": result.entitled_exchanges,
             "discovered_instruments": result.discovered_instruments,
+            "plant_capacity_probe_enabled": result.plant_capacity_probe_enabled,
+            "order_with_ticker_connected": result.order_with_ticker_connected,
+            "history_with_ticker_and_order_connected": result.history_with_ticker_and_order_connected,
+            "history_with_ticker_only_connected": result.history_with_ticker_only_connected,
+            "order_connection_error": result.order_connection_error,
+            "history_with_order_connection_error": result.history_with_order_connection_error,
+            "history_ticker_only_connection_error": result.history_ticker_only_connection_error,
             "max_bid_levels": result.max_bid_levels,
             "max_ask_levels": result.max_ask_levels,
             "book_adds": result.book_adds,

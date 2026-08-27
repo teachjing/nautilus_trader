@@ -43,6 +43,8 @@ pub const DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID: i32 = 117;
 pub const DEPTH_BY_ORDER_UPDATES_RESPONSE_TEMPLATE_ID: i32 = 118;
 pub const DEPTH_BY_ORDER_TEMPLATE_ID: i32 = 160;
 pub const DEPTH_BY_ORDER_END_EVENT_TEMPLATE_ID: i32 = 161;
+pub const TIME_BAR_REPLAY_REQUEST_TEMPLATE_ID: i32 = 202;
+pub const TIME_BAR_REPLAY_RESPONSE_TEMPLATE_ID: i32 = 203;
 pub const LIST_EXCHANGE_PERMISSIONS_REQUEST_TEMPLATE_ID: i32 = 342;
 pub const LIST_EXCHANGE_PERMISSIONS_RESPONSE_TEMPLATE_ID: i32 = 343;
 
@@ -192,6 +194,106 @@ pub enum EntitlementFlag {
     Unspecified = 0,
     Enabled = 1,
     Disabled = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum TimeBarType {
+    Unspecified = 0,
+    Second = 1,
+    Minute = 2,
+    Daily = 3,
+    Weekly = 4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum ReplayDirection {
+    Unspecified = 0,
+    First = 1,
+    Last = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum ReplayTimeOrder {
+    Unspecified = 0,
+    Forwards = 1,
+    Backwards = 2,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestTimeBarReplay {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, tag = "110100")]
+    pub symbol: String,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(enumeration = "TimeBarType", tag = "119200")]
+    pub bar_type: i32,
+    #[prost(int32, tag = "119112")]
+    pub bar_type_period: i32,
+    #[prost(int32, tag = "153002")]
+    pub start_index: i32,
+    #[prost(int32, tag = "153003")]
+    pub finish_index: i32,
+    #[prost(int32, tag = "154020")]
+    pub user_max_count: i32,
+    #[prost(enumeration = "ReplayDirection", tag = "149253")]
+    pub direction: i32,
+    #[prost(enumeration = "ReplayTimeOrder", tag = "149307")]
+    pub time_order: i32,
+    #[prost(bool, tag = "153642")]
+    pub resume_bars: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ResponseTimeBarReplay {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, tag = "132758")]
+    pub request_key: String,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, repeated, tag = "132764")]
+    pub rq_handler_rp_code: Vec<String>,
+    #[prost(string, repeated, tag = "132766")]
+    pub rp_code: Vec<String>,
+    #[prost(string, tag = "110100")]
+    pub symbol: String,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(enumeration = "TimeBarType", tag = "119200")]
+    pub bar_type: i32,
+    #[prost(string, tag = "119112")]
+    pub period: String,
+    #[prost(int32, tag = "119100")]
+    pub marker: i32,
+    #[prost(uint64, tag = "119109")]
+    pub num_trades: u64,
+    #[prost(uint64, tag = "119110")]
+    pub volume: u64,
+    #[prost(uint64, tag = "119117")]
+    pub bid_volume: u64,
+    #[prost(uint64, tag = "119118")]
+    pub ask_volume: u64,
+    #[prost(double, tag = "100019")]
+    pub open_price: f64,
+    #[prost(double, tag = "100021")]
+    pub close_price: f64,
+    #[prost(double, tag = "100012")]
+    pub high_price: f64,
+    #[prost(double, tag = "100013")]
+    pub low_price: f64,
+    #[prost(double, tag = "100070")]
+    pub settlement_price: f64,
+    #[prost(bool, tag = "149138")]
+    pub has_settlement_price: bool,
+    #[prost(bool, tag = "154571")]
+    pub must_clear_settlement_price: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -648,6 +750,7 @@ pub enum InboundMessage {
     DepthByOrderEnd(DepthByOrderEndEvent),
     ExchangePermission(ResponseListExchangePermissions),
     SearchSymbol(ResponseSearchSymbols),
+    TimeBarReplay(ResponseTimeBarReplay),
     Reject(ResponseCode),
     ForcedLogout,
     Unsupported(i32),
@@ -696,6 +799,9 @@ pub fn decode_inbound(frame: &[u8]) -> anyhow::Result<InboundMessage> {
         ),
         SEARCH_SYMBOLS_RESPONSE_TEMPLATE_ID => {
             InboundMessage::SearchSymbol(ResponseSearchSymbols::decode(payload)?)
+        }
+        TIME_BAR_REPLAY_RESPONSE_TEMPLATE_ID => {
+            InboundMessage::TimeBarReplay(ResponseTimeBarReplay::decode(payload)?)
         }
         REJECT_TEMPLATE_ID => InboundMessage::Reject(ResponseCode::decode(payload)?),
         FORCED_LOGOUT_TEMPLATE_ID => InboundMessage::ForcedLogout,
@@ -820,5 +926,29 @@ mod tests {
         };
         assert_eq!(decoded.symbol, "ESU6");
         assert_eq!(decoded.product_code, "ES");
+    }
+
+    #[rstest]
+    fn decodes_historical_time_bar_replay() {
+        let response = ResponseTimeBarReplay {
+            template_id: TIME_BAR_REPLAY_RESPONSE_TEMPLATE_ID,
+            symbol: "ESU6".to_string(),
+            exchange: "CME".to_string(),
+            marker: 1_700_000_060,
+            open_price: 6_000.0,
+            high_price: 6_001.25,
+            low_price: 5_999.75,
+            close_price: 6_000.50,
+            volume: 123,
+            ..Default::default()
+        };
+
+        let InboundMessage::TimeBarReplay(decoded) =
+            decode_inbound(&encode_frame(&response)).unwrap()
+        else {
+            panic!("Expected historical time-bar response")
+        };
+        assert_eq!(decoded.marker, 1_700_000_060);
+        assert_eq!(decoded.close_price, 6_000.50);
     }
 }

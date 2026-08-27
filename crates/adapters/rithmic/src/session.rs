@@ -40,12 +40,14 @@ use crate::{
         LoginCredentials, MarketSubscription, ensure_response_success, heartbeat_interval,
         heartbeat_request,
     },
+    history::{RithmicHistoricalBarType, parse_time_bar},
     parse::{
         QuoteState, mbo_order_id, parse_depth_by_order_snapshot, parse_depth_by_order_update,
         parse_order_book, parse_quote, parse_trade,
     },
     protocol::{
-        EntitlementFlag, FORCED_LOGOUT_TEMPLATE_ID, InboundMessage, LOGOUT_REQUEST_TEMPLATE_ID,
+        EntitlementFlag, FORCED_LOGOUT_TEMPLATE_ID, InboundMessage, InfrastructureType,
+        LOGOUT_REQUEST_TEMPLATE_ID,
         LOGIN_RESPONSE_TEMPLATE_ID, REJECT_TEMPLATE_ID, RequestLogout, RequestSystemInfo,
         RequestFrontMonthContract, ResponseCode, ResponseFrontMonthContract, ResponseSystemInfo,
         SYSTEM_INFO_REQUEST_TEMPLATE_ID, SYSTEM_INFO_RESPONSE_TEMPLATE_ID, SubscriptionRequest,
@@ -55,7 +57,8 @@ use crate::{
         DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID, DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID,
         LIST_EXCHANGE_PERMISSIONS_REQUEST_TEMPLATE_ID, RequestListExchangePermissions,
         RequestSearchSymbols, SEARCH_SYMBOLS_REQUEST_TEMPLATE_ID, SearchInstrumentType,
-        SearchPattern,
+        SearchPattern, ReplayDirection, ReplayTimeOrder, RequestTimeBarReplay,
+        TIME_BAR_REPLAY_REQUEST_TEMPLATE_ID, TimeBarType,
     },
 };
 
@@ -109,6 +112,17 @@ pub(crate) struct RawOrderBookMetricsSnapshot {
     pub(crate) mbo_entries_with_priority: u64,
     pub(crate) mbo_entries_with_previous_price: u64,
     pub(crate) mbo_selected_price: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlantConnectionCapacity {
+    pub(crate) ticker_connected: bool,
+    pub(crate) order_with_ticker_connected: bool,
+    pub(crate) history_with_ticker_and_order_connected: bool,
+    pub(crate) history_with_ticker_only_connected: bool,
+    pub(crate) order_error: Option<String>,
+    pub(crate) history_with_order_error: Option<String>,
+    pub(crate) history_ticker_only_error: Option<String>,
 }
 
 impl RawOrderBookMetrics {
@@ -340,10 +354,141 @@ impl Debug for RithmicSession {
 }
 
 impl RithmicSession {
+    async fn connect_without_discovery(
+        gateway_url: &str,
+        credentials: &LoginCredentials,
+        diagnostic_log: Option<Arc<DiagnosticLog>>,
+        infrastructure: InfrastructureType,
+        available_systems: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let (mut socket, _) = connect_async(gateway_url).await?;
+        let login_request = match infrastructure {
+            InfrastructureType::TickerPlant => credentials.ticker_plant_request(),
+            InfrastructureType::OrderPlant => credentials.order_plant_request(),
+            InfrastructureType::HistoryPlant => credentials.history_plant_request(),
+            _ => anyhow::bail!("Unsupported Rithmic infrastructure {infrastructure:?}"),
+        };
+        Self::send_protobuf(&mut socket, &login_request).await?;
+        let response = Self::receive_expected(&mut socket, LOGIN_RESPONSE_TEMPLATE_ID).await?;
+        let InboundMessage::Login(login) = response else {
+            anyhow::bail!("Rithmic login returned an unexpected response")
+        };
+        let heartbeat_interval = heartbeat_interval(&login)?;
+        if let Some(log) = &diagnostic_log {
+            log.record(
+                "plant_capacity_login",
+                "success",
+                serde_json::json!({
+                    "infrastructure": format!("{infrastructure:?}"),
+                    "rp_code": login.rp_code,
+                }),
+            );
+        }
+        Ok(Self {
+            socket,
+            heartbeat_interval,
+            available_systems,
+            diagnostic_log,
+        })
+    }
+
+    pub(crate) async fn probe_plant_connection_capacity(
+        gateway_url: &str,
+        credentials: &LoginCredentials,
+        diagnostic_log_dir: Option<&str>,
+    ) -> anyhow::Result<PlantConnectionCapacity> {
+        nautilus_cryptography::providers::install_cryptographic_provider();
+        let diagnostic_log = DiagnosticLog::create(diagnostic_log_dir)?;
+        let systems = Self::discover_systems(gateway_url, diagnostic_log.as_ref()).await?;
+        anyhow::ensure!(
+            systems.system_name.iter().any(|name| name == &credentials.system_name),
+            "Rithmic system '{}' is unavailable",
+            credentials.system_name
+        );
+        let available_systems = systems.system_name;
+        let mut result = PlantConnectionCapacity::default();
+        let mut ticker = Self::connect_without_discovery(
+            gateway_url,
+            credentials,
+            diagnostic_log.clone(),
+            InfrastructureType::TickerPlant,
+            available_systems.clone(),
+        )
+        .await?;
+        result.ticker_connected = true;
+
+        let mut order = match Self::connect_without_discovery(
+            gateway_url,
+            credentials,
+            diagnostic_log.clone(),
+            InfrastructureType::OrderPlant,
+            available_systems.clone(),
+        )
+        .await
+        {
+            Ok(session) => {
+                result.order_with_ticker_connected = true;
+                Some(session)
+            }
+            Err(error) => {
+                result.order_error = Some(format!("{error:#}"));
+                None
+            }
+        };
+
+        let mut history = match Self::connect_without_discovery(
+            gateway_url,
+            credentials,
+            diagnostic_log.clone(),
+            InfrastructureType::HistoryPlant,
+            available_systems.clone(),
+        )
+        .await
+        {
+            Ok(session) => {
+                result.history_with_ticker_and_order_connected = order.is_some();
+                result.history_with_ticker_only_connected = order.is_none();
+                Some(session)
+            }
+            Err(error) => {
+                result.history_with_order_error = Some(format!("{error:#}"));
+                None
+            }
+        };
+        if let Some(session) = &mut history {
+            session.logout_and_close().await?;
+        }
+        if let Some(session) = &mut order {
+            session.logout_and_close().await?;
+        }
+
+        if !result.history_with_ticker_and_order_connected
+            && !result.history_with_ticker_only_connected
+        {
+            match Self::connect_without_discovery(
+                gateway_url,
+                credentials,
+                diagnostic_log,
+                InfrastructureType::HistoryPlant,
+                available_systems,
+            )
+            .await
+            {
+                Ok(mut session) => {
+                    result.history_with_ticker_only_connected = true;
+                    session.logout_and_close().await?;
+                }
+                Err(error) => result.history_ticker_only_error = Some(format!("{error:#}")),
+            }
+        }
+        ticker.logout_and_close().await?;
+        Ok(result)
+    }
     async fn connect_inner(
         gateway_url: &str,
         credentials: &LoginCredentials,
         diagnostic_log: Option<Arc<DiagnosticLog>>,
+        infrastructure: InfrastructureType,
     ) -> anyhow::Result<Self> {
         nautilus_cryptography::providers::install_cryptographic_provider();
 
@@ -358,14 +503,20 @@ impl RithmicSession {
         );
 
         let (mut socket, _) = connect_async(gateway_url).await?;
-        Self::send_protobuf(&mut socket, &credentials.ticker_plant_request()).await?;
+        let login_request = match infrastructure {
+            InfrastructureType::TickerPlant => credentials.ticker_plant_request(),
+            InfrastructureType::OrderPlant => credentials.order_plant_request(),
+            InfrastructureType::HistoryPlant => credentials.history_plant_request(),
+            _ => anyhow::bail!("Unsupported Rithmic infrastructure {infrastructure:?}"),
+        };
+        Self::send_protobuf(&mut socket, &login_request).await?;
         let response = Self::receive_expected(&mut socket, LOGIN_RESPONSE_TEMPLATE_ID).await?;
         let InboundMessage::Login(login) = response else {
             anyhow::bail!("Rithmic login returned an unexpected response")
         };
         if let Some(log) = &diagnostic_log {
             log.record(
-                "ticker_plant_login",
+                "plant_login",
                 if login.rp_code.first().is_some_and(|code| code == "0") {
                     "success"
                 } else {
@@ -373,6 +524,7 @@ impl RithmicSession {
                 },
                 serde_json::json!({
                     "system_name": credentials.system_name,
+                    "infrastructure": format!("{infrastructure:?}"),
                     "rp_code": login.rp_code,
                     "heartbeat_interval": login.heartbeat_interval,
                 }),
@@ -381,8 +533,8 @@ impl RithmicSession {
         let heartbeat_interval = heartbeat_interval(&login)?;
 
         log::info!(
-            "Connected to Rithmic ticker plant '{}'",
-            credentials.system_name
+            "Connected to Rithmic {infrastructure:?} '{}'",
+            credentials.system_name,
         );
 
         Ok(Self {
@@ -403,7 +555,13 @@ impl RithmicSession {
     ) -> anyhow::Result<(Self, Vec<MarketSubscription>)> {
         tokio::time::timeout(timeout, async {
             let diagnostic_log = DiagnosticLog::create(diagnostic_log_dir)?;
-            let mut session = Self::connect_inner(gateway_url, credentials, diagnostic_log).await?;
+            let mut session = Self::connect_inner(
+                gateway_url,
+                credentials,
+                diagnostic_log,
+                InfrastructureType::TickerPlant,
+            )
+            .await?;
             let mut resolved = Vec::with_capacity(subscriptions.len());
             for subscription in subscriptions {
                 let subscription = session
@@ -525,22 +683,31 @@ impl RithmicSession {
         self.diagnostic_log.as_ref().map(|log| log.path.as_path())
     }
 
-    /// Discovers exchange entitlements and, optionally, futures instruments for each entitled
-    /// exchange on the authenticated ticker-plant session.
-    pub(crate) async fn discover_catalog(
-        &mut self,
-        user: &str,
+    /// Discovers exchange entitlements on an Order Plant socket, closes it, then optionally
+    /// discovers futures instruments on a separate Ticker Plant socket.
+    pub(crate) async fn discover_catalog_sequential(
+        gateway_url: &str,
+        credentials: &LoginCredentials,
         include_instruments: bool,
+        diagnostic_log_dir: Option<&str>,
     ) -> anyhow::Result<RithmicDiscoveryCatalog> {
+        let diagnostic_log = DiagnosticLog::create(diagnostic_log_dir)?;
+        let mut order_session = Self::connect_inner(
+            gateway_url,
+            credentials,
+            diagnostic_log.clone(),
+            InfrastructureType::OrderPlant,
+        )
+        .await?;
         let request = RequestListExchangePermissions {
             template_id: LIST_EXCHANGE_PERMISSIONS_REQUEST_TEMPLATE_ID,
             user_msg: vec!["catalog_exchanges".to_string()],
-            user: user.to_string(),
+            user: credentials.user.clone(),
         };
-        Self::send_protobuf(&mut self.socket, &request).await?;
+        Self::send_protobuf(&mut order_session.socket, &request).await?;
         let mut catalog = RithmicDiscoveryCatalog::default();
         loop {
-            let response = self.receive_exchange_permission().await?;
+            let response = order_session.receive_exchange_permission().await?;
             Self::ensure_handler_codes_succeed(&response.rq_handler_rp_code)?;
             if !response.exchange.is_empty() {
                 catalog.exchanges.push(RithmicExchangeInfo {
@@ -555,8 +722,16 @@ impl RithmicSession {
                 break;
             }
         }
+        order_session.logout_and_close().await?;
 
         if include_instruments {
+            let mut ticker_session = Self::connect_inner(
+                gateway_url,
+                credentials,
+                diagnostic_log.clone(),
+                InfrastructureType::TickerPlant,
+            )
+            .await?;
             let exchanges = catalog
                 .exchanges
                 .iter()
@@ -564,8 +739,11 @@ impl RithmicSession {
                 .map(|exchange| exchange.exchange.clone())
                 .collect::<Vec<_>>();
             for exchange in exchanges {
-                catalog.instruments.extend(self.search_futures(&exchange).await?);
+                catalog
+                    .instruments
+                    .extend(ticker_session.search_futures(&exchange).await?);
             }
+            ticker_session.logout_and_close().await?;
             catalog.instruments.sort_by(|a, b| {
                 (&a.exchange, &a.symbol).cmp(&(&b.exchange, &b.symbol))
             });
@@ -574,7 +752,7 @@ impl RithmicSession {
             });
         }
         catalog.exchanges.sort_by(|a, b| a.exchange.cmp(&b.exchange));
-        if let Some(log) = &self.diagnostic_log {
+        if let Some(log) = &diagnostic_log {
             log.record(
                 "market_instrument_discovery",
                 "success",
@@ -587,6 +765,145 @@ impl RithmicSession {
             );
         }
         Ok(catalog)
+    }
+
+    pub(crate) async fn logout_and_close(&mut self) -> anyhow::Result<()> {
+        let logout = RequestLogout {
+            template_id: LOGOUT_REQUEST_TEMPLATE_ID,
+            ..Default::default()
+        };
+        Self::send_protobuf(&mut self.socket, &logout).await?;
+        self.socket.close(None).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn connect_history(
+        gateway_url: &str,
+        credentials: &LoginCredentials,
+        diagnostic_log_dir: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let diagnostic_log = DiagnosticLog::create(diagnostic_log_dir)?;
+        Self::connect_inner(
+            gateway_url,
+            credentials,
+            diagnostic_log,
+            InfrastructureType::HistoryPlant,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn replay_time_bars(
+        &mut self,
+        exchange: &str,
+        symbol: &str,
+        requested_type: RithmicHistoricalBarType,
+        period: u32,
+        start_seconds: i32,
+        finish_seconds: i32,
+        max_pages: usize,
+        clock: &'static AtomicTime,
+    ) -> anyhow::Result<(Vec<nautilus_model::data::Bar>, usize)> {
+        let protocol_type = match requested_type {
+            RithmicHistoricalBarType::Second => TimeBarType::Second,
+            RithmicHistoricalBarType::Minute => TimeBarType::Minute,
+            RithmicHistoricalBarType::Daily => TimeBarType::Daily,
+            RithmicHistoricalBarType::Weekly => TimeBarType::Weekly,
+        };
+        let mut bars = Vec::new();
+        let mut page_start = start_seconds;
+        let mut pages = 0_usize;
+        let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+
+        while pages < max_pages && page_start <= finish_seconds {
+            pages += 1;
+            let request = RequestTimeBarReplay {
+                template_id: TIME_BAR_REPLAY_REQUEST_TEMPLATE_ID,
+                user_msg: vec![format!("historical:{exchange}:{symbol}:{pages}")],
+                symbol: symbol.to_string(),
+                exchange: exchange.to_string(),
+                bar_type: protocol_type as i32,
+                bar_type_period: period as i32,
+                start_index: page_start,
+                finish_index: finish_seconds,
+                user_max_count: 10_000,
+                direction: ReplayDirection::First as i32,
+                time_order: ReplayTimeOrder::Forwards as i32,
+                resume_bars: false,
+            };
+            Self::send_protobuf(&mut self.socket, &request).await?;
+            let page_initial_count = bars.len();
+            let mut last_marker = 0_i32;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                        anyhow::bail!("Rithmic historical replay stalled for 30 seconds")
+                    }
+                    _ = heartbeat.tick() => {
+                        Self::send_protobuf(&mut self.socket, &heartbeat_request(0, 0)).await?;
+                    }
+                    message = self.socket.next() => {
+                        let Some(message) = message else {
+                            anyhow::bail!("Rithmic History Plant stream ended during replay")
+                        };
+                        match message? {
+                            WebSocketMessage::Binary(data) => match decode_inbound(&data)? {
+                                InboundMessage::TimeBarReplay(response) => {
+                                    Self::ensure_handler_codes_succeed(&response.rq_handler_rp_code)?;
+                                    if response.marker > 0 && !response.symbol.is_empty() {
+                                        last_marker = last_marker.max(response.marker);
+                                        bars.push(parse_time_bar(
+                                            &response,
+                                            requested_type,
+                                            period,
+                                            clock.get_time_ns(),
+                                        )?);
+                                    }
+                                    if !response.rp_code.is_empty() {
+                                        Self::ensure_codes_succeed(response.template_id, &response.rp_code)?;
+                                        break;
+                                    }
+                                }
+                                InboundMessage::Reject(response) => {
+                                    Self::ensure_codes_succeed(REJECT_TEMPLATE_ID, &response.rp_code)?;
+                                }
+                                InboundMessage::ForcedLogout => anyhow::bail!("Rithmic forced logout during historical replay"),
+                                _ => {}
+                            },
+                            WebSocketMessage::Ping(data) => self.socket.send(WebSocketMessage::Pong(data)).await?,
+                            WebSocketMessage::Close(frame) => anyhow::bail!("Rithmic History Plant closed during replay: {frame:?}"),
+                            WebSocketMessage::Text(_) | WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
+                        }
+                    }
+                }
+            }
+            if bars.len() == page_initial_count || last_marker <= 0 || last_marker >= finish_seconds {
+                break;
+            }
+            page_start = last_marker.saturating_add(1);
+        }
+        bars.sort_by_key(|bar| bar.ts_event);
+        bars.dedup_by_key(|bar| bar.ts_event);
+        if let Some(log) = &self.diagnostic_log {
+            log.record(
+                "historical_time_bar_replay",
+                "success",
+                serde_json::json!({
+                    "instrument": format!("{symbol}.{exchange}"),
+                    "bar_type": format!("{requested_type:?}"),
+                    "period": period,
+                    "start_seconds": start_seconds,
+                    "finish_seconds": finish_seconds,
+                    "pages": pages,
+                    "bars": bars.len(),
+                    "first_timestamp": bars.first().map(|bar| bar.ts_event.as_u64()),
+                    "last_timestamp": bars.last().map(|bar| bar.ts_event.as_u64()),
+                }),
+            );
+        }
+        Ok((bars, pages))
     }
 
     async fn search_futures(&mut self, exchange: &str) -> anyhow::Result<Vec<RithmicInstrumentInfo>> {
@@ -1147,6 +1464,7 @@ impl RithmicSession {
             InboundMessage::DepthByOrderEnd(response) => Some(response.template_id),
             InboundMessage::ExchangePermission(response) => Some(response.template_id),
             InboundMessage::SearchSymbol(response) => Some(response.template_id),
+            InboundMessage::TimeBarReplay(response) => Some(response.template_id),
             InboundMessage::Unsupported(template_id) => Some(*template_id),
             InboundMessage::ForcedLogout => Some(FORCED_LOGOUT_TEMPLATE_ID),
         }
