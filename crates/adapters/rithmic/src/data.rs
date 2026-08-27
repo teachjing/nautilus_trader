@@ -213,12 +213,15 @@ impl DataClient for RithmicDataClient {
         let clock = self.clock;
         connected.store(true, Ordering::Release);
         self.session_task = Some(get_runtime().spawn(async move {
-            let mut active_session = session;
+            let mut active_session = Some(session);
             let mut backoff = ReconnectBackoff::new(initial_delay, maximum_delay)
                 .expect("validated Rithmic reconnect delays");
 
             loop {
-                let result = active_session
+                let session = active_session
+                    .take()
+                    .expect("Rithmic session available before run");
+                let result = session
                     .run(
                         subscriptions.clone(),
                         data_sender.clone(),
@@ -254,7 +257,7 @@ impl DataClient for RithmicDataClient {
                     .await
                     {
                         Ok(session) => {
-                            active_session = session;
+                            active_session = Some(session);
                             backoff.reset();
                             connected.store(true, Ordering::Release);
                             log::info!("Rithmic ticker plant reconnected and resubscribed");
