@@ -55,8 +55,9 @@ use crate::{
         encode_frame, DepthByOrder, DepthUpdateType, RequestDepthByOrderSnapshot,
         RequestDepthByOrderUpdates, ResponseDepthByOrderSnapshot,
         DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID, DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID,
-        LIST_EXCHANGE_PERMISSIONS_REQUEST_TEMPLATE_ID, RequestListExchangePermissions,
-        RequestSearchSymbols, SEARCH_SYMBOLS_REQUEST_TEMPLATE_ID, SearchInstrumentType,
+        LIST_EXCHANGE_PERMISSIONS_REQUEST_TEMPLATE_ID, PRODUCT_CODES_REQUEST_TEMPLATE_ID,
+        RequestListExchangePermissions, RequestProductCodes, RequestSearchSymbols,
+        SEARCH_SYMBOLS_REQUEST_TEMPLATE_ID, SearchInstrumentType,
         SearchPattern, ReplayDirection, ReplayTimeOrder, RequestTimeBarReplay,
         TIME_BAR_REPLAY_REQUEST_TEMPLATE_ID, TimeBarType,
     },
@@ -739,9 +740,14 @@ impl RithmicSession {
                 .map(|exchange| exchange.exchange.clone())
                 .collect::<Vec<_>>();
             for exchange in exchanges {
-                catalog
-                    .instruments
-                    .extend(ticker_session.search_futures(&exchange).await?);
+                let product_codes = ticker_session.product_codes(&exchange).await?;
+                for product_code in product_codes {
+                    catalog.instruments.extend(
+                        ticker_session
+                            .search_futures(&exchange, &product_code)
+                            .await?,
+                    );
+                }
             }
             ticker_session.logout_and_close().await?;
             catalog.instruments.sort_by(|a, b| {
@@ -906,13 +912,45 @@ impl RithmicSession {
         Ok((bars, pages))
     }
 
-    async fn search_futures(&mut self, exchange: &str) -> anyhow::Result<Vec<RithmicInstrumentInfo>> {
+    async fn product_codes(&mut self, exchange: &str) -> anyhow::Result<Vec<String>> {
+        let request = RequestProductCodes {
+            template_id: PRODUCT_CODES_REQUEST_TEMPLATE_ID,
+            user_msg: vec![format!("catalog_products:{exchange}")],
+            exchange: exchange.to_string(),
+            give_toi_products_only: false,
+        };
+        Self::send_protobuf(&mut self.socket, &request).await?;
+        let mut product_codes = Vec::new();
+        loop {
+            let response = self.receive_product_code().await?;
+            Self::ensure_handler_codes_succeed(&response.rq_handler_rp_code)?;
+            if !response.product_code.is_empty() {
+                product_codes.push(response.product_code);
+            }
+            if !response.rp_code.is_empty() {
+                if response.rp_code.first().is_some_and(|code| code == "7") {
+                    break;
+                }
+                Self::ensure_codes_succeed(response.template_id, &response.rp_code)?;
+                break;
+            }
+        }
+        product_codes.sort();
+        product_codes.dedup();
+        Ok(product_codes)
+    }
+
+    async fn search_futures(
+        &mut self,
+        exchange: &str,
+        product_code: &str,
+    ) -> anyhow::Result<Vec<RithmicInstrumentInfo>> {
         let request = RequestSearchSymbols {
             template_id: SEARCH_SYMBOLS_REQUEST_TEMPLATE_ID,
-            user_msg: vec![format!("catalog_instruments:{exchange}")],
-            search_text: String::new(),
+            user_msg: vec![format!("catalog_instruments:{exchange}:{product_code}")],
+            search_text: product_code.to_string(),
             exchange: exchange.to_string(),
-            product_code: String::new(),
+            product_code: product_code.to_string(),
             instrument_type: SearchInstrumentType::Future as i32,
             pattern: SearchPattern::Contains as i32,
         };
@@ -960,6 +998,17 @@ impl RithmicSession {
         loop {
             match self.receive_discovery_message().await? {
                 InboundMessage::SearchSymbol(response) => return Ok(response),
+                _ => continue,
+            }
+        }
+    }
+
+    async fn receive_product_code(
+        &mut self,
+    ) -> anyhow::Result<crate::protocol::ResponseProductCodes> {
+        loop {
+            match self.receive_discovery_message().await? {
+                InboundMessage::ProductCode(response) => return Ok(response),
                 _ => continue,
             }
         }
@@ -1463,6 +1512,7 @@ impl RithmicSession {
             InboundMessage::DepthByOrder(response) => Some(response.template_id),
             InboundMessage::DepthByOrderEnd(response) => Some(response.template_id),
             InboundMessage::ExchangePermission(response) => Some(response.template_id),
+            InboundMessage::ProductCode(response) => Some(response.template_id),
             InboundMessage::SearchSymbol(response) => Some(response.template_id),
             InboundMessage::TimeBarReplay(response) => Some(response.template_id),
             InboundMessage::Unsupported(template_id) => Some(*template_id),

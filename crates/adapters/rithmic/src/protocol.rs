@@ -35,6 +35,8 @@ pub const MARKET_DATA_REQUEST_TEMPLATE_ID: i32 = 100;
 pub const MARKET_DATA_RESPONSE_TEMPLATE_ID: i32 = 101;
 pub const SEARCH_SYMBOLS_REQUEST_TEMPLATE_ID: i32 = 109;
 pub const SEARCH_SYMBOLS_RESPONSE_TEMPLATE_ID: i32 = 110;
+pub const PRODUCT_CODES_REQUEST_TEMPLATE_ID: i32 = 111;
+pub const PRODUCT_CODES_RESPONSE_TEMPLATE_ID: i32 = 112;
 pub const FRONT_MONTH_REQUEST_TEMPLATE_ID: i32 = 113;
 pub const FRONT_MONTH_RESPONSE_TEMPLATE_ID: i32 = 114;
 pub const DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID: i32 = 115;
@@ -366,6 +368,42 @@ pub struct ResponseSearchSymbols {
     pub instrument_type: String,
     #[prost(string, tag = "100067")]
     pub expiration_date: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestProductCodes {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(bool, tag = "153499")]
+    pub give_toi_products_only: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ResponseProductCodes {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, repeated, tag = "132764")]
+    pub rq_handler_rp_code: Vec<String>,
+    #[prost(string, repeated, tag = "132766")]
+    pub rp_code: Vec<String>,
+    #[prost(string, tag = "110101")]
+    pub exchange: String,
+    #[prost(string, tag = "100003")]
+    pub symbol_name: String,
+    #[prost(string, tag = "100749")]
+    pub product_code: String,
+    #[prost(string, tag = "154682")]
+    pub timezone_time_of_interest: String,
+    #[prost(int32, tag = "154680")]
+    pub begin_time_of_interest_msm: i32,
+    #[prost(int32, tag = "154681")]
+    pub end_time_of_interest_msm: i32,
 }
 
 pub mod update_bits {
@@ -749,6 +787,7 @@ pub enum InboundMessage {
     DepthByOrder(DepthByOrder),
     DepthByOrderEnd(DepthByOrderEndEvent),
     ExchangePermission(ResponseListExchangePermissions),
+    ProductCode(ResponseProductCodes),
     SearchSymbol(ResponseSearchSymbols),
     TimeBarReplay(ResponseTimeBarReplay),
     Reject(ResponseCode),
@@ -797,6 +836,9 @@ pub fn decode_inbound(frame: &[u8]) -> anyhow::Result<InboundMessage> {
         LIST_EXCHANGE_PERMISSIONS_RESPONSE_TEMPLATE_ID => InboundMessage::ExchangePermission(
             ResponseListExchangePermissions::decode(payload)?,
         ),
+        PRODUCT_CODES_RESPONSE_TEMPLATE_ID => {
+            InboundMessage::ProductCode(ResponseProductCodes::decode(payload)?)
+        }
         SEARCH_SYMBOLS_RESPONSE_TEMPLATE_ID => {
             InboundMessage::SearchSymbol(ResponseSearchSymbols::decode(payload)?)
         }
@@ -925,6 +967,25 @@ mod tests {
             panic!("Expected symbol-search response")
         };
         assert_eq!(decoded.symbol, "ESU6");
+        assert_eq!(decoded.product_code, "ES");
+    }
+
+    #[rstest]
+    fn decodes_product_code_discovery() {
+        let response = ResponseProductCodes {
+            template_id: PRODUCT_CODES_RESPONSE_TEMPLATE_ID,
+            exchange: "CME".to_string(),
+            symbol_name: "E-mini S&P 500".to_string(),
+            product_code: "ES".to_string(),
+            ..Default::default()
+        };
+
+        let InboundMessage::ProductCode(decoded) =
+            decode_inbound(&encode_frame(&response)).unwrap()
+        else {
+            panic!("Expected product-code response")
+        };
+        assert_eq!(decoded.exchange, "CME");
         assert_eq!(decoded.product_code, "ES");
     }
 
