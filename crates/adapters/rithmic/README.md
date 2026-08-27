@@ -176,6 +176,28 @@ It also writes JSON-safe OHLCV records to a path such as
 are `second`, `minute`, `daily`, and `weekly`; `RITHMIC_HISTORICAL_BAR_PERIOD` supplies the interval
 multiple.
 
+API, UI, and notebook callers can pass one JSON object to `run_historical_query_object` instead of
+binding each option as a static route parameter:
+
+```json
+{
+  "exchange": "CME",
+  "symbol": "MESU6",
+  "bar_type": "minute",
+  "period": 1,
+  "lookback_seconds": 86400,
+  "options": {
+    "max_pages": 10
+  },
+  "request_id": "ui-123"
+}
+```
+
+Explicit `start_seconds` and `finish_seconds` override the calculated lookback window. Unknown
+top-level properties are retained as generic correlation metadata. Adapter-specific controls live
+inside the nested `options` property bag; only the Rithmic adapter interprets them, so they do not
+become HTTP query parameters or expand Nautilus's generic historical request surface.
+
 ## Remaining adapter work
 
 - Convert the discovery catalog into full Nautilus `FuturesContract` definitions.
