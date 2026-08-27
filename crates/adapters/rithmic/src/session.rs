@@ -62,6 +62,10 @@ use crate::{
         TIME_BAR_REPLAY_REQUEST_TEMPLATE_ID, TimeBarType,
     },
 };
+use crate::transport::{
+    PingManager, WEBSOCKET_PING_INTERVAL, WEBSOCKET_PING_TIMEOUT, close_with_timeout,
+    send_with_timeout,
+};
 
 type RithmicWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -672,7 +676,7 @@ impl RithmicSession {
             );
         }
         Self::ensure_codes_succeed(systems.template_id, &systems.rp_code)?;
-        socket.close(None).await?;
+        close_with_timeout(&mut socket).await?;
         Ok(systems)
     }
 
@@ -819,7 +823,7 @@ impl RithmicSession {
             ..Default::default()
         };
         Self::send_protobuf(&mut self.socket, &logout).await?;
-        self.socket.close(None).await?;
+        close_with_timeout(&mut self.socket).await?;
         Ok(())
     }
 
@@ -922,7 +926,7 @@ impl RithmicSession {
                                 InboundMessage::ForcedLogout => anyhow::bail!("Rithmic forced logout during historical replay"),
                                 _ => {}
                             },
-                            WebSocketMessage::Ping(data) => self.socket.send(WebSocketMessage::Pong(data)).await?,
+                            WebSocketMessage::Ping(data) => send_with_timeout(&mut self.socket, WebSocketMessage::Pong(data)).await?,
                             WebSocketMessage::Close(frame) => anyhow::bail!("Rithmic History Plant closed during replay: {frame:?}"),
                             WebSocketMessage::Text(_) | WebSocketMessage::Pong(_) | WebSocketMessage::Frame(_) => {}
                         }
@@ -1091,7 +1095,7 @@ impl RithmicSession {
                     }
                 }
                 WebSocketMessage::Ping(data) => {
-                    self.socket.send(WebSocketMessage::Pong(data)).await?;
+                    send_with_timeout(&mut self.socket, WebSocketMessage::Pong(data)).await?;
                 }
                 WebSocketMessage::Close(frame) => {
                     anyhow::bail!("Rithmic WebSocket closed during catalog discovery: {frame:?}")
@@ -1136,12 +1140,16 @@ impl RithmicSession {
         depth_by_order_price: Option<f64>,
     ) -> anyhow::Result<()> {
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
+        let mut websocket_ping = tokio::time::interval(WEBSOCKET_PING_INTERVAL);
+        let mut ping_manager = PingManager::new(WEBSOCKET_PING_TIMEOUT);
         let mut book_sequence = 0_u64;
         let mut quote_cache = HashMap::<InstrumentId, QuoteState>::new();
         let mut depth_by_order_requests = HashMap::<InstrumentId, (MarketSubscription, f64)>::new();
         let mut mbo_order_ids = HashMap::<u64, String>::new();
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        websocket_ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await;
+        websocket_ping.tick().await;
 
         if probe_depth_by_order {
             if let Some(depth_price) = depth_by_order_price {
@@ -1172,12 +1180,28 @@ impl RithmicSession {
                 _ = heartbeat.tick() => {
                     Self::send_protobuf(&mut self.socket, &heartbeat_request(0, 0)).await?;
                 }
+                _ = websocket_ping.tick() => {
+                    send_with_timeout(
+                        &mut self.socket,
+                        WebSocketMessage::Ping(Vec::new().into()),
+                    ).await?;
+                    ping_manager.sent();
+                }
+                () = ping_manager.timed_out() => {
+                    anyhow::bail!(
+                        "Rithmic WebSocket pong timed out after {WEBSOCKET_PING_TIMEOUT:?}"
+                    )
+                }
                 message = self.socket.next() => {
                     let Some(message) = message else {
                         anyhow::bail!("Rithmic WebSocket stream ended")
                     };
+                    let message = message?;
+                    if matches!(&message, WebSocketMessage::Pong(_)) {
+                        ping_manager.received();
+                    }
                     self.handle_websocket_message(
-                        message?,
+                        message,
                         &data_sender,
                         clock,
                         &mut book_sequence,
@@ -1204,7 +1228,7 @@ impl RithmicSession {
             ..Default::default()
         };
         Self::send_protobuf(&mut self.socket, &logout).await?;
-        self.socket.close(None).await?;
+        close_with_timeout(&mut self.socket).await?;
         Ok(())
     }
 
@@ -1429,7 +1453,7 @@ impl RithmicSession {
                 anyhow::bail!("Rithmic WebSocket closed: {frame:?}")
             }
             WebSocketMessage::Ping(data) => {
-                self.socket.send(WebSocketMessage::Pong(data)).await?;
+                send_with_timeout(&mut self.socket, WebSocketMessage::Pong(data)).await?;
             }
             WebSocketMessage::Text(_)
             | WebSocketMessage::Pong(_)
@@ -1545,7 +1569,7 @@ impl RithmicSession {
                     }
                 }
                 WebSocketMessage::Ping(data) => {
-                    socket.send(WebSocketMessage::Pong(data)).await?;
+                    send_with_timeout(socket, WebSocketMessage::Pong(data)).await?;
                 }
                 WebSocketMessage::Close(frame) => {
                     anyhow::bail!("Rithmic WebSocket closed while awaiting response: {frame:?}")
@@ -1587,10 +1611,11 @@ impl RithmicSession {
         socket: &mut RithmicWebSocket,
         message: &M,
     ) -> anyhow::Result<()> {
-        socket
-            .send(WebSocketMessage::Binary(encode_frame(message).into()))
-            .await?;
-        Ok(())
+        send_with_timeout(
+            socket,
+            WebSocketMessage::Binary(encode_frame(message).into()),
+        )
+        .await
     }
 
     fn ensure_codes_succeed(template_id: i32, rp_code: &[String]) -> anyhow::Result<()> {
