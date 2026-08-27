@@ -8,18 +8,28 @@
 
 //! Live connection diagnostics for the Rithmic ticker-plant adapter.
 
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    fs::OpenOptions,
+    io::Write,
+    time::Duration,
+};
 
 use nautilus_common::messages::DataEvent;
 use nautilus_core::time::get_atomic_clock_realtime;
-use nautilus_model::data::Data;
+use nautilus_model::{
+    data::{Data, OrderBookDelta},
+    enums::{BookAction, BookType, OrderSide, RecordFlag},
+    identifiers::InstrumentId,
+    types::Price,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::RithmicDataClientConfig,
     flow::{LoginCredentials, MarketSubscription},
     protocol::update_bits,
-    session::RithmicSession,
+    session::{RawOrderBookMetrics, RithmicSession},
 };
 
 /// Results from one live Rithmic ticker-plant connection probe.
@@ -39,6 +49,39 @@ pub struct RithmicConnectionProbeResult {
     pub order_book_batches: u64,
     /// Total number of native Nautilus order-book deltas received.
     pub order_book_deltas: u64,
+    /// Granularity proven by the received native book data.
+    pub order_book_type: Option<BookType>,
+    /// Maximum number of bid price levels simultaneously observed.
+    pub max_bid_levels: usize,
+    /// Maximum number of ask price levels simultaneously observed.
+    pub max_ask_levels: usize,
+    /// Number of order-book add actions received.
+    pub book_adds: u64,
+    /// Number of order-book update actions received.
+    pub book_updates: u64,
+    /// Number of order-book delete actions received.
+    pub book_deletes: u64,
+    /// Number of order-book clear actions received.
+    pub book_clears: u64,
+    /// Number of book deltas carrying a nonzero exchange order ID.
+    pub book_deltas_with_order_ids: u64,
+    /// Whether individual order cancellations are visible in the received feed.
+    pub individual_cancels_visible: bool,
+    /// Number of raw Rithmic template 156 messages received.
+    pub raw_book_messages: u64,
+    /// Maximum bid entries carried by one raw template 156 message.
+    pub max_raw_bid_entries: u64,
+    /// Maximum ask entries carried by one raw template 156 message.
+    pub max_raw_ask_entries: u64,
+    /// Raw book messages containing aggregate order-count metadata.
+    pub book_messages_with_order_counts: u64,
+    /// Raw book messages containing nonzero implied-liquidity metadata.
+    pub book_messages_with_implicit_liquidity: u64,
+}
+
+#[derive(Default)]
+struct OrderBookProbeState {
+    levels: HashSet<(InstrumentId, OrderSide, Price)>,
 }
 
 impl RithmicConnectionProbeResult {
@@ -88,7 +131,10 @@ pub async fn run_connection_probe(
             .collect(),
         ..Default::default()
     };
+    let mut book_state = OrderBookProbeState::default();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let raw_book_metrics = std::sync::Arc::new(RawOrderBookMetrics::default());
+    let task_raw_book_metrics = std::sync::Arc::clone(&raw_book_metrics);
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let mut session_task = tokio::spawn(async move {
@@ -98,6 +144,7 @@ pub async fn run_connection_probe(
                 sender,
                 get_atomic_clock_realtime(),
                 task_cancel,
+                Some(task_raw_book_metrics),
             )
             .await
     });
@@ -111,7 +158,7 @@ pub async fn run_connection_probe(
                 let Some(event) = event else {
                     anyhow::bail!("Rithmic live probe event channel closed unexpectedly")
                 };
-                count_event(&mut result, event);
+                count_event(&mut result, &mut book_state, event);
             }
             outcome = &mut session_task => {
                 let outcome = outcome?;
@@ -123,23 +170,126 @@ pub async fn run_connection_probe(
 
     cancel.cancel();
     session_task.await??;
+    (
+        result.raw_book_messages,
+        result.max_raw_bid_entries,
+        result.max_raw_ask_entries,
+        result.book_messages_with_order_counts,
+        result.book_messages_with_implicit_liquidity,
+    ) = raw_book_metrics.snapshot();
+    if result.order_book_type.is_none() && result.quotes > 0 {
+        result.order_book_type = Some(BookType::L1_MBP);
+    }
+    result.individual_cancels_visible = result.order_book_type == Some(BookType::L3_MBO)
+        && result.book_deletes > 0
+        && result.book_deltas_with_order_ids > 0;
+    write_capability_summary(&result)?;
     Ok(result)
 }
 
-fn count_event(result: &mut RithmicConnectionProbeResult, event: DataEvent) {
+fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Result<()> {
+    let Some(path) = &result.diagnostic_log_path else {
+        return Ok(());
+    };
+    let record = serde_json::json!({
+        "stage": "order_book_capabilities",
+        "status": "observed",
+        "details": {
+            "order_book_type": result.order_book_type.map(|value| value.to_string()),
+            "max_bid_levels": result.max_bid_levels,
+            "max_ask_levels": result.max_ask_levels,
+            "book_adds": result.book_adds,
+            "book_updates": result.book_updates,
+            "book_deletes": result.book_deletes,
+            "book_clears": result.book_clears,
+            "book_deltas_with_order_ids": result.book_deltas_with_order_ids,
+            "individual_cancels_visible": result.individual_cancels_visible,
+            "raw_book_messages": result.raw_book_messages,
+            "max_raw_bid_entries": result.max_raw_bid_entries,
+            "max_raw_ask_entries": result.max_raw_ask_entries,
+            "book_messages_with_order_counts": result.book_messages_with_order_counts,
+            "book_messages_with_implicit_liquidity":
+                result.book_messages_with_implicit_liquidity,
+        },
+    });
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{record}")?;
+    Ok(())
+}
+
+fn count_event(
+    result: &mut RithmicConnectionProbeResult,
+    state: &mut OrderBookProbeState,
+    event: DataEvent,
+) {
     match event {
         DataEvent::Data(Data::Trade(_)) => result.trades += 1,
         DataEvent::Data(Data::Quote(_)) => result.quotes += 1,
         DataEvent::Data(Data::Deltas(deltas)) => {
             result.order_book_batches += 1;
             result.order_book_deltas += deltas.deltas.len() as u64;
+            for delta in deltas.deltas {
+                count_book_delta(result, state, delta);
+            }
         }
-        DataEvent::Data(Data::Delta(_)) => {
+        DataEvent::Data(Data::Delta(delta)) => {
             result.order_book_batches += 1;
             result.order_book_deltas += 1;
+            count_book_delta(result, state, delta);
         }
         _ => {}
     }
+}
+
+fn count_book_delta(
+    result: &mut RithmicConnectionProbeResult,
+    state: &mut OrderBookProbeState,
+    delta: OrderBookDelta,
+) {
+    if RecordFlag::F_MBP.matches(delta.flags) {
+        result.order_book_type = Some(BookType::L2_MBP);
+    } else if delta.order.order_id != 0 {
+        result.order_book_type = Some(BookType::L3_MBO);
+    }
+
+    match delta.action {
+        BookAction::Add => result.book_adds += 1,
+        BookAction::Update => result.book_updates += 1,
+        BookAction::Delete => result.book_deletes += 1,
+        BookAction::Clear => result.book_clears += 1,
+    }
+    if delta.order.order_id != 0 {
+        result.book_deltas_with_order_ids += 1;
+    }
+
+    let key = (delta.instrument_id, delta.order.side, delta.order.price);
+    match delta.action {
+        BookAction::Add | BookAction::Update => {
+            state.levels.insert(key);
+        }
+        BookAction::Delete => {
+            state.levels.remove(&key);
+        }
+        BookAction::Clear => {
+            state
+                .levels
+                .retain(|(instrument_id, _, _)| *instrument_id != delta.instrument_id);
+        }
+    }
+    result.max_bid_levels = result.max_bid_levels.max(
+        state
+            .levels
+            .iter()
+            .filter(|(_, side, _)| *side == OrderSide::Buy)
+            .count(),
+    );
+    result.max_ask_levels = result.max_ask_levels.max(
+        state
+            .levels
+            .iter()
+            .filter(|(_, side, _)| *side == OrderSide::Sell)
+            .count(),
+    );
 }
 
 fn credentials(config: &RithmicDataClientConfig) -> anyhow::Result<LoginCredentials> {
@@ -213,8 +363,39 @@ mod tests {
             ts,
         );
 
-        count_event(&mut result, DataEvent::Data(Data::Trade(trade)));
+        let mut state = OrderBookProbeState::default();
+        count_event(&mut result, &mut state, DataEvent::Data(Data::Trade(trade)));
         assert_eq!(result.trades, 1);
         assert_eq!(result.total_events(), 1);
+    }
+
+    #[rstest]
+    fn classifies_aggregated_book_levels_as_l2_mbp() {
+        let instrument_id = InstrumentId::from("MESU6.CME");
+        let ts = nautilus_core::UnixNanos::from(1);
+        let delta = OrderBookDelta::new(
+            instrument_id,
+            BookAction::Update,
+            nautilus_model::data::BookOrder::new(
+                OrderSide::Buy,
+                Price::from("6000.25"),
+                nautilus_model::types::Quantity::from(10),
+                0,
+            ),
+            RecordFlag::F_MBP as u8,
+            1,
+            ts,
+            ts,
+        );
+        let mut result = RithmicConnectionProbeResult::default();
+        let mut state = OrderBookProbeState::default();
+
+        count_event(&mut result, &mut state, DataEvent::Data(Data::Delta(delta)));
+
+        assert_eq!(result.order_book_type, Some(BookType::L2_MBP));
+        assert_eq!(result.max_bid_levels, 1);
+        assert_eq!(result.book_updates, 1);
+        assert_eq!(result.book_deltas_with_order_ids, 0);
+        assert!(!result.individual_cancels_visible);
     }
 }

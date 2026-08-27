@@ -14,7 +14,10 @@ use std::{
     fs::{create_dir_all, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -48,6 +51,48 @@ use crate::{
 };
 
 type RithmicWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Debug, Default)]
+pub(crate) struct RawOrderBookMetrics {
+    messages: AtomicU64,
+    max_bid_entries: AtomicU64,
+    max_ask_entries: AtomicU64,
+    messages_with_order_counts: AtomicU64,
+    messages_with_implicit_liquidity: AtomicU64,
+}
+
+impl RawOrderBookMetrics {
+    fn observe(&self, update: &crate::protocol::OrderBook) {
+        self.messages.fetch_add(1, Ordering::Relaxed);
+        self.max_bid_entries
+            .fetch_max(update.bid_price.len() as u64, Ordering::Relaxed);
+        self.max_ask_entries
+            .fetch_max(update.ask_price.len() as u64, Ordering::Relaxed);
+        if update.bid_orders.iter().any(|count| *count > 0)
+            || update.ask_orders.iter().any(|count| *count > 0)
+        {
+            self.messages_with_order_counts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if update.implicit_bid_size.iter().any(|size| *size > 0)
+            || update.implicit_ask_size.iter().any(|size| *size > 0)
+        {
+            self.messages_with_implicit_liquidity
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.messages.load(Ordering::Relaxed),
+            self.max_bid_entries.load(Ordering::Relaxed),
+            self.max_ask_entries.load(Ordering::Relaxed),
+            self.messages_with_order_counts.load(Ordering::Relaxed),
+            self.messages_with_implicit_liquidity
+                .load(Ordering::Relaxed),
+        )
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReconnectBackoff {
@@ -340,6 +385,7 @@ impl RithmicSession {
         data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
         clock: &'static AtomicTime,
         cancel: CancellationToken,
+        raw_book_metrics: Option<Arc<RawOrderBookMetrics>>,
     ) -> anyhow::Result<()> {
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
         let mut book_sequence = 0_u64;
@@ -364,6 +410,7 @@ impl RithmicSession {
                         clock,
                         &mut book_sequence,
                         &mut quote_cache,
+                        raw_book_metrics.as_ref(),
                     ).await?;
                 }
             }
@@ -388,6 +435,7 @@ impl RithmicSession {
         clock: &AtomicTime,
         book_sequence: &mut u64,
         quote_cache: &mut HashMap<InstrumentId, QuoteState>,
+        raw_book_metrics: Option<&Arc<RawOrderBookMetrics>>,
     ) -> anyhow::Result<()> {
         match message {
             WebSocketMessage::Binary(data) => match decode_inbound(&data)? {
@@ -430,6 +478,9 @@ impl RithmicSession {
                     }
                 }
                 InboundMessage::OrderBook(update) => {
+                    if let Some(metrics) = raw_book_metrics {
+                        metrics.observe(&update);
+                    }
                     *book_sequence = book_sequence.saturating_add(1);
                     match parse_order_book(
                         &update,
@@ -732,5 +783,22 @@ mod tests {
         assert!(parse_fallback(Some("CME.MES"), &requested).is_err());
         assert!(parse_fallback(Some("CME.NQU6"), &requested).is_err());
         assert!(parse_fallback(Some("CBOT.MESU6"), &requested).is_err());
+    }
+
+    #[rstest]
+    fn captures_raw_market_by_price_metadata() {
+        let metrics = RawOrderBookMetrics::default();
+        let update = crate::protocol::OrderBook {
+            bid_price: vec![6000.00, 5999.75],
+            bid_orders: vec![3, 2],
+            implicit_bid_size: vec![0, 4],
+            ask_price: vec![6000.25],
+            ask_orders: vec![5],
+            ..Default::default()
+        };
+
+        metrics.observe(&update);
+
+        assert_eq!(metrics.snapshot(), (1, 2, 1, 1, 1));
     }
 }

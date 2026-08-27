@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use nautilus_model::enums::BookType;
 use nautilus_rithmic::{
     config::RithmicDataClientConfig,
     diagnostics::run_connection_probe,
@@ -50,6 +51,10 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
     assert!(!result.resolved_subscriptions.is_empty());
     assert!(result.available_systems.contains(&expected_system_name));
     assert!(result.diagnostic_log_path.is_some());
+    assert_eq!(result.order_book_type, Some(BookType::L2_MBP));
+    assert!(result.order_book_deltas > 0);
+    assert_eq!(result.book_deltas_with_order_ids, 0);
+    assert!(!result.individual_cancels_visible);
     assert!(
         result.total_events() > 0,
         "Connected successfully but received no native market-data events; \

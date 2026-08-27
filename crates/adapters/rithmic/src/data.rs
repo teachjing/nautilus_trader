@@ -231,6 +231,7 @@ impl DataClient for RithmicDataClient {
                         data_sender.clone(),
                         clock,
                         cancel.clone(),
+                        None,
                     )
                     .await;
                 connected.store(false, Ordering::Release);

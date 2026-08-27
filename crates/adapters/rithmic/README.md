@@ -83,6 +83,13 @@ names, response codes, contract-resolution results, fallback selection, and subs
 but never the Rithmic username or password. The result printed by the test includes the exact log
 path.
 
+The live result also classifies the observed order-book capability. Template 151 is top-of-book
+(`L1_MBP`). Template 156 is aggregated full-depth market by price (`L2_MBP`) and can include the
+number of orders and implied size at each price. Size-zero template 156 updates become price-level
+deletes; they do not identify an individual canceled order. True market by order (`L3_MBO`) requires
+the separate depth-by-order request/update flow (templates 115-118 and 160-161), which is not part
+of the template 156 subscription.
+
 For a bounded multi-symbol probe, set a comma-separated list and run the example:
 
 ```bash
