@@ -28,6 +28,7 @@ pub mod parse;
 pub mod protocol;
 
 mod session;
+mod transport;
 
 #[cfg(feature = "python")]
 pub mod python;
