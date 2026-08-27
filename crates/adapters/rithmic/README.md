@@ -53,19 +53,25 @@ cargo check -p nautilus-rithmic
 cargo test -p nautilus-rithmic -- --nocapture
 ```
 
-## Todo ##
-- Register as workspace member
-- Py03 crate
-- Makefile
-- Python Package
+Live Tests (Test from main repo folder nautilus_trader)
 
-Live Tests
 ```
-
-
 cargo test \
   -p nautilus-rithmic \
   --test live_connection \
   --features live-tests \
   -- --ignored --nocapture
 ```
+
+## Todo ##
+- Register as workspace member
+- Py03 crate
+- Makefile
+- Python Package
+- Update Readme or documentation
+- Update which plants and templates enriches which Nautilus Data Type
+    - 
+
+## References Documentation ## 
+- [Nautilus Data Types] - https://nautilustrader.io/docs/latest/concepts/data/
+- [Rithmic Websocket Docs] - docs/rithmic_reference.pdf
