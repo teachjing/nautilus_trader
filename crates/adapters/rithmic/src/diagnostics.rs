@@ -27,10 +27,69 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::RithmicDataClientConfig,
+    discovery::RithmicExchangeInfo,
     flow::{LoginCredentials, MarketSubscription},
     protocol::update_bits,
     session::{RawOrderBookMetrics, RithmicSession},
 };
+
+/// Result of querying every market-data exchange permission for the authenticated user.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RithmicMarketEntitlementProbeResult {
+    pub output_path: String,
+    pub available_markets: usize,
+    pub entitled_markets: usize,
+    pub exchanges: Vec<RithmicExchangeInfo>,
+}
+
+/// Queries and saves all Rithmic exchange market-data entitlements without subscribing to data.
+///
+/// # Errors
+///
+/// Returns an error when credentials are unavailable, discovery fails, or JSON cannot be saved.
+pub async fn run_market_entitlement_probe(
+    config: &RithmicDataClientConfig,
+) -> anyhow::Result<RithmicMarketEntitlementProbeResult> {
+    let credentials = credentials(config)?;
+    let timeout_secs = std::env::var("RITHMIC_DISCOVERY_TIMEOUT_SECS")
+        .ok()
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid RITHMIC_DISCOVERY_TIMEOUT_SECS: {e}"))?
+        .unwrap_or(120);
+    let catalog = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        RithmicSession::discover_catalog_sequential(
+            &config.gateway_url,
+            &credentials,
+            false,
+            &[],
+            config.diagnostic_log_dir.as_deref(),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("Rithmic market entitlement discovery timed out after {timeout_secs}s")
+    })??;
+    let output_dir = config
+        .diagnostic_log_dir
+        .as_deref()
+        .unwrap_or("target/rithmic-diagnostics");
+    let output_path = std::path::Path::new(output_dir).join("rithmic-market-entitlements.json");
+    let available_markets = catalog.exchanges.len();
+    let entitled_markets = catalog.exchanges.iter().filter(|value| value.entitled).count();
+    let result = RithmicMarketEntitlementProbeResult {
+        output_path: output_path.display().to_string(),
+        available_markets,
+        entitled_markets,
+        exchanges: catalog.exchanges,
+    };
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&output_path, serde_json::to_vec_pretty(&result)?)?;
+    Ok(result)
+}
 
 /// Results from one live Rithmic ticker-plant connection probe.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

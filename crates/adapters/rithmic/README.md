@@ -113,6 +113,19 @@ The result distinguishes Order-with-Ticker, History-with-Ticker-and-Order, and a
 with only Ticker held open. This identifies whether the limit is global, per plant, or total socket
 count for the account.
 
+Run only the complete market entitlement report (no active market data is required):
+
+```bash
+cargo test -p nautilus-rithmic \
+  --test live_market_entitlements \
+  --features live-tests \
+  -- --ignored --nocapture
+```
+
+The test prints every market returned by Rithmic with its entitlement flag and reported L1/L2
+access. It also writes the same result to
+`target/rithmic-diagnostics/rithmic-market-entitlements.json`.
+
 ## Historical time-bar replay
 
 The Rithmic reference guide assigns templates 202/203 to the History Plant. Replay responses carry
