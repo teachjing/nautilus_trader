@@ -796,7 +796,7 @@ impl RithmicSession {
         )
         .await?;
         let instruments = session
-            .search_futures_by_text(exchange, search_text, None)
+            .search_futures_by_text(exchange, search_text, Some(search_text))
             .await?;
         session.logout_and_close().await?;
         if let Some(log) = &diagnostic_log {
@@ -1028,6 +1028,15 @@ impl RithmicSession {
                 break;
             }
         }
+        if let Some(product_code) = product_code {
+            instruments.retain(|instrument| {
+                instrument.product_code.eq_ignore_ascii_case(product_code)
+            });
+        }
+        instruments.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        instruments.dedup_by(|a, b| {
+            a.exchange == b.exchange && a.symbol == b.symbol
+        });
         Ok(instruments)
     }
 

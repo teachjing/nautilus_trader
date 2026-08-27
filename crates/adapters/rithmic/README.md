@@ -126,7 +126,7 @@ The test prints every market returned by Rithmic with its entitlement flag and r
 access. It also writes the same result to
 `target/rithmic-diagnostics/rithmic-market-entitlements.json`.
 
-Search contracts interactively for one selected market and search string:
+Search contracts interactively for one selected market and exact product code:
 
 ```bash
 export RITHMIC_SEARCH_EXCHANGE="CME"
@@ -138,7 +138,8 @@ cargo test -p nautilus-rithmic \
   -- --ignored --nocapture
 ```
 
-This uses templates 109/110 directly and writes the typed matches to
+This sends the value as both template 109 `search_text` and `product_code`, validates exact
+product-code matches locally, and writes the typed template 110 results to
 `target/rithmic-diagnostics/rithmic-instrument-search-CME-MES.json`. The public Rust function
 `run_instrument_search` provides the same focused operation for a future UI/API endpoint.
 

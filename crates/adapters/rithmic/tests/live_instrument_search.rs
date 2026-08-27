@@ -41,5 +41,10 @@ async fn searches_contracts_for_selected_market_and_text() {
     assert_eq!(result.search_text, search_text.trim().to_ascii_uppercase());
     assert!(result.match_count > 0);
     assert!(!result.instruments.is_empty());
+    assert!(result.instruments.iter().all(|instrument| {
+        instrument
+            .product_code
+            .eq_ignore_ascii_case(&result.search_text)
+    }));
     assert!(std::path::Path::new(&result.output_path).exists());
 }
