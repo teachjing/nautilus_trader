@@ -56,7 +56,7 @@ fn discover_catalog_json(
 ) -> PyResult<String> {
     let credentials = discovery_credentials(&config)?;
     let exchanges = instrument_exchanges.unwrap_or_default();
-    py.allow_threads(move || {
+    py.detach(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -94,7 +94,7 @@ fn search_instruments_json(
         return Err(to_pyruntime_err("Rithmic exchange and query are required"));
     }
     let credentials = discovery_credentials(&config)?;
-    py.allow_threads(move || {
+    py.detach(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
