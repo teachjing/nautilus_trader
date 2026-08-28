@@ -1727,19 +1727,17 @@ impl RithmicSession {
                             }),
                         );
                     }
-                    let instrument_id = match checked_instrument_id(
-                        &response.symbol,
-                        &response.exchange,
-                    ) {
-                        Ok(instrument_id) => instrument_id,
-                        Err(e) if response.exchange_order_id.is_empty() => {
-                            log::debug!("Ignoring empty Rithmic MBO snapshot frame: {e}");
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            log::warn!("Ignoring invalid Rithmic MBO snapshot: {e}");
-                            return Ok(());
-                        }
+                    let Some(instrument_id) = Self::mbo_snapshot_instrument_id(
+                        &response,
+                        mbo_sync,
+                    ) else {
+                        log::warn!(
+                            "Ignoring uncorrelated Rithmic MBO snapshot frame: symbol='{}', exchange='{}', user_msg={:?}",
+                            response.symbol,
+                            response.exchange,
+                            response.user_msg,
+                        );
+                        return Ok(());
                     };
                     Self::validate_mbo_order_ids(&response.exchange_order_id, mbo_order_ids)?;
                     let snapshot_complete = response.rq_handler_rp_code.is_empty();
@@ -1965,13 +1963,37 @@ impl RithmicSession {
     ) -> anyhow::Result<()> {
         let snapshot = RequestDepthByOrderSnapshot {
             template_id: DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID,
-            user_msg: vec!["mbo_snapshot".to_string()],
+            user_msg: vec![format!(
+                "mbo_snapshot:{}.{}",
+                subscription.symbol, subscription.exchange
+            )],
             symbol: subscription.symbol.clone(),
             exchange: subscription.exchange.clone(),
             depth_price,
             ..Default::default()
         };
         Self::send_protobuf(&mut self.socket, &snapshot).await
+    }
+
+    fn mbo_snapshot_instrument_id(
+        response: &ResponseDepthByOrderSnapshot,
+        states: &HashMap<InstrumentId, MboSyncState>,
+    ) -> Option<InstrumentId> {
+        if let Ok(instrument_id) = checked_instrument_id(&response.symbol, &response.exchange) {
+            return Some(instrument_id);
+        }
+        for user_msg in &response.user_msg {
+            if let Some(value) = user_msg.strip_prefix("mbo_snapshot:") {
+                if let Ok(instrument_id) = InstrumentId::from_as_ref(value) {
+                    return Some(instrument_id);
+                }
+            }
+        }
+        let mut awaiting = states.iter().filter_map(|(instrument_id, state)| {
+            (state.phase == MboSyncPhase::AwaitingSnapshot).then_some(*instrument_id)
+        });
+        let instrument_id = awaiting.next()?;
+        awaiting.next().is_none().then_some(instrument_id)
     }
 
     fn complete_mbo_snapshot(
@@ -2524,6 +2546,35 @@ mod tests {
         }));
         assert!(
             nautilus_model::enums::RecordFlag::F_LAST.matches(deltas.deltas[2].flags)
+        );
+    }
+
+    #[rstest]
+    fn correlates_empty_mbo_snapshot_boundary_to_request() {
+        let instrument_id = InstrumentId::from("MESU6.CME");
+        let states = HashMap::from([(instrument_id, MboSyncState::default())]);
+        let response = ResponseDepthByOrderSnapshot {
+            user_msg: vec!["mbo_snapshot:MESU6.CME".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            RithmicSession::mbo_snapshot_instrument_id(&response, &states),
+            Some(instrument_id)
+        );
+    }
+
+    #[rstest]
+    fn correlates_single_pending_empty_mbo_snapshot_boundary() {
+        let instrument_id = InstrumentId::from("MESU6.CME");
+        let states = HashMap::from([(instrument_id, MboSyncState::default())]);
+
+        assert_eq!(
+            RithmicSession::mbo_snapshot_instrument_id(
+                &ResponseDepthByOrderSnapshot::default(),
+                &states,
+            ),
+            Some(instrument_id)
         );
     }
 }
