@@ -123,7 +123,7 @@ struct MboSyncState {
     last_sequence: u64,
     snapshot_deltas: Vec<OrderBookDelta>,
     buffered_updates: Vec<DepthByOrder>,
-    gap_count: u64,
+    sequence_jump_count: u64,
     resnapshot_count: u64,
 }
 
@@ -149,6 +149,7 @@ pub(crate) struct RawOrderBookMetrics {
     mbo_entries_with_order_ids: AtomicU64,
     mbo_entries_with_priority: AtomicU64,
     mbo_entries_with_previous_price: AtomicU64,
+    mbo_sequence_jumps: AtomicU64,
     mbo_sequence_gaps: AtomicU64,
     mbo_resnapshots: AtomicU64,
     mbo_selected_price_bits: AtomicU64,
@@ -176,6 +177,7 @@ pub(crate) struct RawOrderBookMetricsSnapshot {
     pub(crate) mbo_entries_with_order_ids: u64,
     pub(crate) mbo_entries_with_priority: u64,
     pub(crate) mbo_entries_with_previous_price: u64,
+    pub(crate) mbo_sequence_jumps: u64,
     pub(crate) mbo_sequence_gaps: u64,
     pub(crate) mbo_resnapshots: u64,
     pub(crate) mbo_selected_price: Option<f64>,
@@ -331,6 +333,7 @@ impl RawOrderBookMetrics {
             mbo_entries_with_previous_price: self
                 .mbo_entries_with_previous_price
                 .load(Ordering::Relaxed),
+            mbo_sequence_jumps: self.mbo_sequence_jumps.load(Ordering::Relaxed),
             mbo_sequence_gaps: self.mbo_sequence_gaps.load(Ordering::Relaxed),
             mbo_resnapshots: self.mbo_resnapshots.load(Ordering::Relaxed),
             mbo_selected_price: (selected_price_bits != 0)
@@ -1829,31 +1832,22 @@ impl RithmicSession {
                         state.buffered_updates.push(update);
                         return Ok(());
                     }
-                    if state.last_sequence != 0
-                        && update.sequence_number > state.last_sequence.saturating_add(1)
-                    {
-                        state.gap_count = state.gap_count.saturating_add(1);
-                        state.resnapshot_count = state.resnapshot_count.saturating_add(1);
+                    if is_nonconsecutive_forward_sequence(
+                        state.last_sequence,
+                        update.sequence_number,
+                    ) {
+                        // Rithmic exposes a venue sequence but does not guarantee that it is a
+                        // contiguous counter for one instrument subscription. Record sparse
+                        // forward movement without claiming packet loss or rebuilding the book.
+                        state.sequence_jump_count = state.sequence_jump_count.saturating_add(1);
                         if let Some(metrics) = raw_book_metrics {
-                            metrics.mbo_sequence_gaps.fetch_add(1, Ordering::Relaxed);
-                            metrics.mbo_resnapshots.fetch_add(1, Ordering::Relaxed);
+                            metrics.mbo_sequence_jumps.fetch_add(1, Ordering::Relaxed);
                         }
-                        state.phase = MboSyncPhase::AwaitingSnapshot;
-                        state.snapshot_sequence = 0;
-                        state.snapshot_deltas.clear();
-                        state.buffered_updates.push(update);
-                        log::warn!(
-                            "Rithmic MBO sequence gap for {instrument_id}: expected {}, received {}; requesting resnapshot",
+                        log::debug!(
+                            "Rithmic MBO non-consecutive sequence for {instrument_id}: expected {}, received {}",
                             state.last_sequence.saturating_add(1),
-                            state.buffered_updates.last().map_or(0, |value| value.sequence_number),
+                            update.sequence_number,
                         );
-                        if let Some((subscription, depth_price)) =
-                            depth_by_order_requests.get(&instrument_id)
-                        {
-                            self.request_depth_by_order_snapshot(subscription, *depth_price)
-                                .await?;
-                        }
-                        return Ok(());
                     }
                     if update.sequence_number < state.last_sequence {
                         log::debug!(
@@ -2055,9 +2049,9 @@ impl RithmicSession {
             }
         }
         log::info!(
-            "Rithmic MBO synchronized for {instrument_id} at sequence {} (gaps={}, resnapshots={})",
+            "Rithmic MBO synchronized for {instrument_id} at sequence {} (sequence_jumps={}, resnapshots={})",
             state.last_sequence,
-            state.gap_count,
+            state.sequence_jump_count,
             state.resnapshot_count,
         );
         Ok(())
@@ -2207,6 +2201,10 @@ impl RithmicSession {
             log::error!("Failed to emit Rithmic data event: {error}");
         }
     }
+}
+
+fn is_nonconsecutive_forward_sequence(last: u64, current: u64) -> bool {
+    last != 0 && current > last.saturating_add(1)
 }
 
 fn looks_like_futures_contract(symbol: &str) -> bool {
@@ -2575,6 +2573,23 @@ mod tests {
                 &states,
             ),
             Some(instrument_id)
+        );
+    }
+
+    #[rstest]
+    #[case(0, 100, false)]
+    #[case(100, 101, false)]
+    #[case(100, 100, false)]
+    #[case(100, 99, false)]
+    #[case(100, 105, true)]
+    fn classifies_nonconsecutive_mbo_sequences_without_claiming_packet_loss(
+        #[case] last: u64,
+        #[case] current: u64,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            is_nonconsecutive_forward_sequence(last, current),
+            expected
         );
     }
 }
