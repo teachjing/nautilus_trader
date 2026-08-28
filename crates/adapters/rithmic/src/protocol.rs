@@ -20,6 +20,8 @@ pub const LAST_TRADE_TEMPLATE_ID: i32 = 150;
 pub const BBO_TEMPLATE_ID: i32 = 151;
 /// Market-by-price order-book update template ID.
 pub const ORDER_BOOK_TEMPLATE_ID: i32 = 156;
+pub const REFERENCE_DATA_REQUEST_TEMPLATE_ID: i32 = 14;
+pub const REFERENCE_DATA_RESPONSE_TEMPLATE_ID: i32 = 15;
 
 pub const LOGIN_REQUEST_TEMPLATE_ID: i32 = 10;
 pub const LOGIN_RESPONSE_TEMPLATE_ID: i32 = 11;
@@ -39,6 +41,10 @@ pub const PRODUCT_CODES_REQUEST_TEMPLATE_ID: i32 = 111;
 pub const PRODUCT_CODES_RESPONSE_TEMPLATE_ID: i32 = 112;
 pub const FRONT_MONTH_REQUEST_TEMPLATE_ID: i32 = 113;
 pub const FRONT_MONTH_RESPONSE_TEMPLATE_ID: i32 = 114;
+pub const TICK_SIZE_TABLE_REQUEST_TEMPLATE_ID: i32 = 107;
+pub const TICK_SIZE_TABLE_RESPONSE_TEMPLATE_ID: i32 = 108;
+pub const AUXILIARY_REFERENCE_DATA_REQUEST_TEMPLATE_ID: i32 = 121;
+pub const AUXILIARY_REFERENCE_DATA_RESPONSE_TEMPLATE_ID: i32 = 122;
 pub const DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID: i32 = 115;
 pub const DEPTH_BY_ORDER_SNAPSHOT_RESPONSE_TEMPLATE_ID: i32 = 116;
 pub const DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID: i32 = 117;
@@ -51,6 +57,114 @@ pub const LIST_EXCHANGE_PERMISSIONS_REQUEST_TEMPLATE_ID: i32 = 342;
 pub const LIST_EXCHANGE_PERMISSIONS_RESPONSE_TEMPLATE_ID: i32 = 343;
 
 pub const PROTOCOL_TEMPLATE_VERSION: &str = "3.9";
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestReferenceData {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, optional, tag = "110100")]
+    pub symbol: Option<String>,
+    #[prost(string, optional, tag = "110101")]
+    pub exchange: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ResponseReferenceData {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, repeated, tag = "132766")]
+    pub rp_code: Vec<String>,
+    #[prost(string, optional, tag = "110100")]
+    pub symbol: Option<String>,
+    #[prost(string, optional, tag = "110101")]
+    pub exchange: Option<String>,
+    #[prost(string, optional, tag = "100003")]
+    pub symbol_name: Option<String>,
+    #[prost(string, optional, tag = "157095")]
+    pub trading_symbol: Option<String>,
+    #[prost(string, optional, tag = "157096")]
+    pub trading_exchange: Option<String>,
+    #[prost(string, optional, tag = "100749")]
+    pub product_code: Option<String>,
+    #[prost(string, optional, tag = "110116")]
+    pub instrument_type: Option<String>,
+    #[prost(string, optional, tag = "101026")]
+    pub underlying_symbol: Option<String>,
+    #[prost(string, optional, tag = "100067")]
+    pub expiration_date: Option<String>,
+    #[prost(string, optional, tag = "154382")]
+    pub currency: Option<String>,
+    #[prost(string, optional, tag = "154167")]
+    pub tick_size_type: Option<String>,
+    #[prost(double, optional, tag = "154386")]
+    pub min_qprice_change: Option<f64>,
+    #[prost(double, optional, tag = "154389")]
+    pub single_point_value: Option<f64>,
+    #[prost(int32, optional, tag = "153068")]
+    pub min_qprice_change_precision: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestAuxiliaryReferenceData {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, optional, tag = "110100")]
+    pub symbol: Option<String>,
+    #[prost(string, optional, tag = "110101")]
+    pub exchange: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ResponseAuxiliaryReferenceData {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132766")]
+    pub rp_code: Vec<String>,
+    #[prost(string, optional, tag = "154932")]
+    pub first_notice_date: Option<String>,
+    #[prost(string, optional, tag = "154996")]
+    pub first_trading_date: Option<String>,
+    #[prost(string, optional, tag = "154236")]
+    pub last_trading_date: Option<String>,
+    #[prost(string, optional, tag = "157023")]
+    pub unit_of_measure: Option<String>,
+    #[prost(double, optional, tag = "157024")]
+    pub unit_of_measure_qty: Option<f64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RequestTickSizeTable {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132760")]
+    pub user_msg: Vec<String>,
+    #[prost(string, optional, tag = "154167")]
+    pub tick_size_type: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ResponseTickSizeTable {
+    #[prost(int32, tag = "154467")]
+    pub template_id: i32,
+    #[prost(string, repeated, tag = "132764")]
+    pub rq_handler_rp_code: Vec<String>,
+    #[prost(string, repeated, tag = "132766")]
+    pub rp_code: Vec<String>,
+    #[prost(string, optional, tag = "154167")]
+    pub tick_size_type: Option<String>,
+    #[prost(double, optional, tag = "154387")]
+    pub min_fprice_change: Option<f64>,
+    #[prost(double, optional, tag = "154168")]
+    pub first_price: Option<f64>,
+    #[prost(double, optional, tag = "154169")]
+    pub last_price: Option<f64>,
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RequestSystemInfo {
@@ -773,6 +887,9 @@ pub fn decode_template_id(frame: &[u8]) -> anyhow::Result<i32> {
 
 #[derive(Debug)]
 pub enum InboundMessage {
+    ReferenceData(ResponseReferenceData),
+    AuxiliaryReferenceData(ResponseAuxiliaryReferenceData),
+    TickSizeTable(ResponseTickSizeTable),
     Login(ResponseLogin),
     Logout(ResponseCode),
     SystemInfo(ResponseSystemInfo),
@@ -804,6 +921,15 @@ pub fn decode_inbound(frame: &[u8]) -> anyhow::Result<InboundMessage> {
     let payload = decode_frame(frame)?;
     let template_id = Base::decode(payload)?.template_id;
     let message = match template_id {
+        REFERENCE_DATA_RESPONSE_TEMPLATE_ID => {
+            InboundMessage::ReferenceData(ResponseReferenceData::decode(payload)?)
+        }
+        AUXILIARY_REFERENCE_DATA_RESPONSE_TEMPLATE_ID => InboundMessage::AuxiliaryReferenceData(
+            ResponseAuxiliaryReferenceData::decode(payload)?,
+        ),
+        TICK_SIZE_TABLE_RESPONSE_TEMPLATE_ID => {
+            InboundMessage::TickSizeTable(ResponseTickSizeTable::decode(payload)?)
+        }
         LOGIN_RESPONSE_TEMPLATE_ID => InboundMessage::Login(ResponseLogin::decode(payload)?),
         LOGOUT_RESPONSE_TEMPLATE_ID => InboundMessage::Logout(ResponseCode::decode(payload)?),
         SYSTEM_INFO_RESPONSE_TEMPLATE_ID => {
