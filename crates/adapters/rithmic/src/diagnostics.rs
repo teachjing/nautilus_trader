@@ -135,7 +135,12 @@ pub async fn run_dynamic_subscription_probe(
     }
 
     runtime_sender.send(RithmicSessionCommand::Unsubscribe(subscription))?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (barrier_sender, barrier_receiver) = tokio::sync::oneshot::channel();
+    runtime_sender.send(RithmicSessionCommand::Barrier(barrier_sender))?;
+    tokio::time::timeout(hydration_timeout, barrier_receiver)
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out unsubscribing Rithmic instrument {instrument_id}"))?
+        .map_err(|_| anyhow::anyhow!("Rithmic unsubscribe acknowledgment channel closed"))?;
     anyhow::ensure!(
         !session_task.is_finished(),
         "Rithmic session stopped while unsubscribing {instrument_id}"
