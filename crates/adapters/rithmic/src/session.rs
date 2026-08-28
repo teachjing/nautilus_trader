@@ -46,6 +46,7 @@ use crate::{
     },
     history::{RithmicHistoricalBarType, parse_time_bar},
     instruments::parse_futures_contract,
+    mbo::RithmicMboEvent,
     parse::{
         QuoteState, mbo_order_id, parse_depth_by_order_snapshot, parse_depth_by_order_update,
         parse_order_book, parse_quote, parse_trade,
@@ -1215,6 +1216,7 @@ impl RithmicSession {
         raw_book_metrics: Option<Arc<RawOrderBookMetrics>>,
         probe_depth_by_order: bool,
         depth_by_order_price: Option<f64>,
+        publish_mbo_events: bool,
     ) -> anyhow::Result<()> {
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
         let mut websocket_ping = tokio::time::interval(WEBSOCKET_PING_INTERVAL);
@@ -1362,6 +1364,7 @@ impl RithmicSession {
                         &mut mbo_order_ids,
                         &mut mbo_sync,
                         &mut heartbeat_watchdog,
+                        publish_mbo_events,
                     ).await?;
                 }
             }
@@ -1585,6 +1588,7 @@ impl RithmicSession {
         mbo_order_ids: &mut HashMap<u64, String>,
         mbo_sync: &mut HashMap<InstrumentId, MboSyncState>,
         heartbeat_watchdog: &mut LivenessWatchdog,
+        publish_mbo_events: bool,
     ) -> anyhow::Result<()> {
         match message {
             WebSocketMessage::Binary(data) => match decode_inbound(&data)? {
@@ -1743,8 +1747,40 @@ impl RithmicSession {
                         return Ok(());
                     };
                     Self::validate_mbo_order_ids(&response.exchange_order_id, mbo_order_ids)?;
+                    let ts_init = clock.get_time_ns();
                     let snapshot_complete = response.rq_handler_rp_code.is_empty();
-                    match parse_depth_by_order_snapshot(&response, clock.get_time_ns()) {
+                    if publish_mbo_events {
+                        match RithmicMboEvent::from_snapshot(&response, instrument_id, ts_init) {
+                            Ok(events) => {
+                                for event in events {
+                                    Self::send_data(
+                                        data_sender,
+                                        Data::Custom(event.into_custom_data()),
+                                    );
+                                }
+                            }
+                            Err(error) if response.exchange_order_id.is_empty() => {
+                                log::debug!("Ignoring empty Rithmic custom MBO snapshot: {error}");
+                            }
+                            Err(error) => {
+                                log::warn!("Ignoring invalid Rithmic custom MBO snapshot: {error}");
+                            }
+                        }
+                        if snapshot_complete {
+                            Self::send_data(
+                                data_sender,
+                                Data::Custom(
+                                    RithmicMboEvent::snapshot_complete(
+                                        instrument_id,
+                                        response.sequence_number,
+                                        ts_init,
+                                    )
+                                    .into_custom_data(),
+                                ),
+                            );
+                        }
+                    }
+                    match parse_depth_by_order_snapshot(&response, ts_init) {
                         Ok(deltas) => {
                             if let Some(state) = mbo_sync.get_mut(&instrument_id) {
                                 state.snapshot_sequence =
@@ -1824,6 +1860,25 @@ impl RithmicSession {
                         }
                     };
                     Self::validate_mbo_order_ids(&update.exchange_order_id, mbo_order_ids)?;
+                    if publish_mbo_events {
+                        match RithmicMboEvent::from_update(
+                            &update,
+                            instrument_id,
+                            clock.get_time_ns(),
+                        ) {
+                            Ok(events) => {
+                                for event in events {
+                                    Self::send_data(
+                                        data_sender,
+                                        Data::Custom(event.into_custom_data()),
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!("Ignoring invalid Rithmic custom MBO update: {error}");
+                            }
+                        }
+                    }
                     let Some(state) = mbo_sync.get_mut(&instrument_id) else {
                         log::debug!("Ignoring unsolicited Rithmic MBO update for {instrument_id}");
                         return Ok(());
