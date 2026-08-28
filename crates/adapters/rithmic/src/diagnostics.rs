@@ -384,7 +384,9 @@ pub struct RithmicConnectionProbeResult {
     pub mbo_entries_with_priority: u64,
     /// Depth-by-order entries carrying a previous price.
     pub mbo_entries_with_previous_price: u64,
-    /// Number of detected exchange-sequence discontinuities.
+    /// Number of non-consecutive forward venue-sequence jumps observed.
+    pub mbo_sequence_jumps: u64,
+    /// Number of confirmed exchange-sequence gaps.
     pub mbo_sequence_gaps: u64,
     /// Number of automatic MBO snapshot recovery requests.
     pub mbo_resnapshots: u64,
@@ -641,6 +643,7 @@ pub async fn run_connection_probe(
     result.mbo_entries_with_order_ids = raw.mbo_entries_with_order_ids;
     result.mbo_entries_with_priority = raw.mbo_entries_with_priority;
     result.mbo_entries_with_previous_price = raw.mbo_entries_with_previous_price;
+    result.mbo_sequence_jumps = raw.mbo_sequence_jumps;
     result.mbo_sequence_gaps = raw.mbo_sequence_gaps;
     result.mbo_resnapshots = raw.mbo_resnapshots;
     result.mbo_capable = result.mbo_entries_with_order_ids > 0
@@ -714,6 +717,7 @@ fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Re
             "mbo_entries_with_order_ids": result.mbo_entries_with_order_ids,
             "mbo_entries_with_priority": result.mbo_entries_with_priority,
             "mbo_entries_with_previous_price": result.mbo_entries_with_previous_price,
+            "mbo_sequence_jumps": result.mbo_sequence_jumps,
             "mbo_sequence_gaps": result.mbo_sequence_gaps,
             "mbo_resnapshots": result.mbo_resnapshots,
             "mbo_capable": result.mbo_capable,
