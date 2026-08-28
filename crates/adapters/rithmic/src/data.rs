@@ -7,8 +7,9 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
+    collections::HashSet,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -19,7 +20,10 @@ use nautilus_common::{
     live::{get_runtime, runner::get_data_event_sender},
     messages::{
         DataEvent,
-        data::{BarsResponse, DataResponse, RequestBars},
+        data::{
+            BarsResponse, DataResponse, RequestBars, SubscribeBookDeltas, SubscribeQuotes,
+            SubscribeTrades, UnsubscribeBookDeltas, UnsubscribeQuotes, UnsubscribeTrades,
+        },
     },
 };
 use nautilus_core::{
@@ -28,18 +32,21 @@ use nautilus_core::{
 };
 use nautilus_model::{
     data::Bar,
-    enums::{AggregationSource, BarAggregation, PriceType},
+    enums::{AggregationSource, BarAggregation, BookType, PriceType},
     identifiers::{ClientId, Venue},
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::RithmicDataClientConfig,
+    config::{RithmicBookFeed, RithmicDataClientConfig},
     flow::{LoginCredentials, MarketSubscription},
     history::RithmicHistoricalBarType,
     protocol::update_bits,
-    session::{ReconnectBackoff, RithmicSession},
+    session::{
+        ReconnectBackoff, RithmicSession, RithmicSessionCommand, RuntimeDataType,
+        RuntimeSubscription,
+    },
 };
 
 const STABLE_SESSION_THRESHOLD: Duration = Duration::from_secs(30);
@@ -68,6 +75,9 @@ pub struct RithmicDataClient {
     history_task: Option<JoinHandle<()>>,
     history_sender: tokio::sync::mpsc::UnboundedSender<HistoryRequest>,
     history_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<HistoryRequest>>,
+    runtime_sender: tokio::sync::mpsc::UnboundedSender<RithmicSessionCommand>,
+    runtime_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<RithmicSessionCommand>>,
+    runtime_subscriptions: Arc<Mutex<HashSet<RuntimeSubscription>>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     clock: &'static AtomicTime,
 }
@@ -100,11 +110,18 @@ impl RithmicDataClient {
             "Rithmic initial reconnect delay cannot exceed maximum delay"
         );
         anyhow::ensure!(
-            !(config.subscribe_book_deltas && config.subscribe_mbo),
+            config.book_feed.is_some()
+                || !(config.subscribe_book_deltas && config.subscribe_mbo),
             "Rithmic L2 market-by-price and L3 market-by-order subscriptions are mutually exclusive"
         );
 
         let (history_sender, history_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime_sender, runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let client_id = config
+            .client_id
+            .as_deref()
+            .map(ClientId::from)
+            .unwrap_or(client_id);
         Ok(Self {
             client_id,
             venue: Venue::from("CME"),
@@ -115,6 +132,9 @@ impl RithmicDataClient {
             history_task: None,
             history_sender,
             history_receiver: Some(history_receiver),
+            runtime_sender,
+            runtime_receiver: Some(runtime_receiver),
+            runtime_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             data_sender: get_data_event_sender(),
             clock: get_atomic_clock_realtime(),
         })
@@ -145,10 +165,6 @@ impl RithmicDataClient {
     }
 
     fn subscriptions(&self) -> anyhow::Result<Vec<MarketSubscription>> {
-        anyhow::ensure!(
-            !(self.config.subscribe_book_deltas && self.config.subscribe_mbo),
-            "Rithmic L2 market-by-price and L3 market-by-order subscriptions are mutually exclusive"
-        );
         let mut bits = 0;
         if self.config.subscribe_trades {
             bits |= update_bits::LAST_TRADE;
@@ -156,11 +172,11 @@ impl RithmicDataClient {
         if self.config.subscribe_quotes {
             bits |= update_bits::BBO;
         }
-        if self.config.subscribe_book_deltas {
+        if self.config.effective_book_feed() == RithmicBookFeed::L2Mbp {
             bits |= update_bits::ORDER_BOOK;
         }
         anyhow::ensure!(
-            bits != 0 || self.config.subscribe_mbo,
+            bits != 0 || self.config.effective_book_feed() == RithmicBookFeed::L3Mbo,
             "At least one Rithmic market-data type must be enabled"
         );
 
@@ -175,6 +191,48 @@ impl RithmicDataClient {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         self.history_sender = sender;
         self.history_receiver = Some(receiver);
+    }
+
+    fn reset_runtime_channel(&mut self) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        self.runtime_sender = sender;
+        self.runtime_receiver = Some(receiver);
+        self.runtime_subscriptions
+            .lock()
+            .expect("Rithmic runtime subscription lock poisoned")
+            .clear();
+    }
+
+    fn send_runtime_subscription(
+        &self,
+        instrument_id: nautilus_model::identifiers::InstrumentId,
+        data_type: RuntimeDataType,
+        subscribe: bool,
+    ) -> anyhow::Result<()> {
+        let subscription = RuntimeSubscription {
+            instrument_id,
+            data_type,
+        };
+        let mut desired = self
+            .runtime_subscriptions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Rithmic runtime subscription lock poisoned"))?;
+        let changed = if subscribe {
+            desired.insert(subscription.clone())
+        } else {
+            desired.remove(&subscription)
+        };
+        if !changed {
+            return Ok(());
+        }
+        let command = if subscribe {
+            RithmicSessionCommand::Subscribe(subscription)
+        } else {
+            RithmicSessionCommand::Unsubscribe(subscription)
+        };
+        self.runtime_sender
+            .send(command)
+            .map_err(|_| anyhow::anyhow!("Rithmic runtime subscription worker is unavailable"))
     }
 }
 
@@ -323,6 +381,7 @@ impl DataClient for RithmicDataClient {
         self.stop()?;
         self.cancellation_token = CancellationToken::new();
         self.reset_history_channel();
+        self.reset_runtime_channel();
         Ok(())
     }
 
@@ -351,7 +410,7 @@ impl DataClient for RithmicDataClient {
         let connect_timeout = Duration::from_secs(self.config.connect_timeout_secs);
         let initial_delay = Duration::from_secs(self.config.reconnect_delay_initial_secs);
         let maximum_delay = Duration::from_secs(self.config.reconnect_delay_max_secs);
-        let subscribe_mbo = self.config.subscribe_mbo;
+        let subscribe_mbo = self.config.effective_book_feed() == RithmicBookFeed::L3Mbo;
         let (session, resolved_subscriptions) = RithmicSession::connect_subscribed(
             &gateway_url,
             &credentials,
@@ -369,6 +428,12 @@ impl DataClient for RithmicDataClient {
         let connected = Arc::clone(&self.connected);
         let data_sender = self.data_sender.clone();
         let clock = self.clock;
+        let mut runtime_receiver = self
+            .runtime_receiver
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Rithmic runtime subscription worker is unavailable"))?;
+        let runtime_sender = self.runtime_sender.clone();
+        let runtime_subscriptions = Arc::clone(&self.runtime_subscriptions);
         if self.history_task.is_none() {
             let history_receiver = self
                 .history_receiver
@@ -398,9 +463,19 @@ impl DataClient for RithmicDataClient {
                     .take()
                     .expect("Rithmic session available before run");
                 let session_started = Instant::now();
+                let desired = runtime_subscriptions
+                    .lock()
+                    .expect("Rithmic runtime subscription lock poisoned")
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for subscription in desired {
+                    let _ = runtime_sender.send(RithmicSessionCommand::Subscribe(subscription));
+                }
                 let result = session
                     .run(
                         resolved_subscriptions,
+                        &mut runtime_receiver,
                         data_sender.clone(),
                         clock,
                         cancel.clone(),
@@ -472,7 +547,53 @@ impl DataClient for RithmicDataClient {
         self.connected.store(false, Ordering::Release);
         self.cancellation_token = CancellationToken::new();
         self.reset_history_channel();
+        self.reset_runtime_channel();
         Ok(())
+    }
+
+    fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
+        let feed = self.config.effective_book_feed();
+        anyhow::ensure!(feed != RithmicBookFeed::None, "Rithmic order-book feed is disabled");
+        let expected = match feed {
+            RithmicBookFeed::L2Mbp => BookType::L2_MBP,
+            RithmicBookFeed::L3Mbo => BookType::L3_MBO,
+            RithmicBookFeed::None => unreachable!(),
+        };
+        anyhow::ensure!(
+            cmd.book_type == expected,
+            "Rithmic client {} is configured for {expected:?}, received {:?}",
+            self.client_id,
+            cmd.book_type,
+        );
+        self.send_runtime_subscription(
+            cmd.instrument_id,
+            RuntimeDataType::Book(feed),
+            true,
+        )
+    }
+
+    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
+        self.send_runtime_subscription(cmd.instrument_id, RuntimeDataType::Quote, true)
+    }
+
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
+        self.send_runtime_subscription(cmd.instrument_id, RuntimeDataType::Trade, true)
+    }
+
+    fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
+        self.send_runtime_subscription(
+            cmd.instrument_id,
+            RuntimeDataType::Book(self.config.effective_book_feed()),
+            false,
+        )
+    }
+
+    fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
+        self.send_runtime_subscription(cmd.instrument_id, RuntimeDataType::Quote, false)
+    }
+
+    fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
+        self.send_runtime_subscription(cmd.instrument_id, RuntimeDataType::Trade, false)
     }
 
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
@@ -600,6 +721,60 @@ mod tests {
         let error = RithmicDataClient::new(ClientId::from("RITHMIC"), config).unwrap_err();
 
         assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[rstest]
+    fn typed_book_feed_controls_identity_and_runtime_book_type() {
+        let config = RithmicDataClientConfig {
+            username: Some("user".to_string()),
+            password: Some("password".to_string()),
+            book_feed: Some(RithmicBookFeed::L3Mbo),
+            client_id: Some("RITHMIC_MBO".to_string()),
+            ..Default::default()
+        };
+        let mut client = RithmicDataClient::new(ClientId::from("RITHMIC"), config).unwrap();
+        let command = SubscribeBookDeltas::new(
+            nautilus_model::identifiers::InstrumentId::from("MESU6.CME"),
+            BookType::L2_MBP,
+            Some(client.client_id()),
+            None,
+            nautilus_core::UUID4::new(),
+            nautilus_core::UnixNanos::default(),
+            None,
+            true,
+            None,
+            None,
+        );
+
+        let error = client.subscribe_book_deltas(command).unwrap_err();
+
+        assert_eq!(client.client_id(), ClientId::from("RITHMIC_MBO"));
+        assert!(error.to_string().contains("L3_MBO"));
+    }
+
+    #[rstest]
+    fn runtime_subscriptions_are_idempotent() {
+        let config = RithmicDataClientConfig {
+            username: Some("user".to_string()),
+            password: Some("password".to_string()),
+            ..Default::default()
+        };
+        let mut client = RithmicDataClient::new(ClientId::from("RITHMIC_MBP"), config).unwrap();
+        let instrument_id = nautilus_model::identifiers::InstrumentId::from("MESU6.CME");
+
+        client
+            .send_runtime_subscription(instrument_id, RuntimeDataType::Quote, true)
+            .unwrap();
+        client
+            .send_runtime_subscription(instrument_id, RuntimeDataType::Quote, true)
+            .unwrap();
+
+        let receiver = client.runtime_receiver.as_mut().unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RithmicSessionCommand::Subscribe(_))
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[rstest]

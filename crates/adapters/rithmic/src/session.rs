@@ -9,7 +9,7 @@
 //! Rithmic ticker-plant WebSocket session.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
     fs::{create_dir_all, OpenOptions},
     io::Write,
@@ -25,7 +25,10 @@ use anyhow::Context;
 use futures_util::StreamExt;
 use nautilus_common::messages::DataEvent;
 use nautilus_core::time::AtomicTime;
-use nautilus_model::{data::Data, identifiers::InstrumentId};
+use nautilus_model::{
+    data::{Data, OrderBookDelta, OrderBookDeltas},
+    identifiers::InstrumentId,
+};
 use prost::Message as ProstMessage;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -35,6 +38,7 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    config::RithmicBookFeed,
     discovery::{RithmicDiscoveryCatalog, RithmicExchangeInfo, RithmicInstrumentInfo},
     flow::{
         LoginCredentials, MarketSubscription, ensure_response_success, heartbeat_interval,
@@ -69,6 +73,46 @@ use crate::transport::{
 
 type RithmicWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Runtime market-data stream controlled through Nautilus subscription commands.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RuntimeDataType {
+    Quote,
+    Trade,
+    Book(RithmicBookFeed),
+}
+
+/// Idempotent runtime subscription key retained across reconnects.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RuntimeSubscription {
+    pub(crate) instrument_id: InstrumentId,
+    pub(crate) data_type: RuntimeDataType,
+}
+
+/// Command sent from the synchronous Nautilus client API to the ticker-plant task.
+#[derive(Debug)]
+pub(crate) enum RithmicSessionCommand {
+    Subscribe(RuntimeSubscription),
+    Unsubscribe(RuntimeSubscription),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MboSyncPhase {
+    #[default]
+    AwaitingSnapshot,
+    Live,
+}
+
+#[derive(Debug, Default)]
+struct MboSyncState {
+    phase: MboSyncPhase,
+    snapshot_sequence: u64,
+    last_sequence: u64,
+    snapshot_deltas: Vec<OrderBookDelta>,
+    buffered_updates: Vec<DepthByOrder>,
+    gap_count: u64,
+    resnapshot_count: u64,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct RawOrderBookMetrics {
     messages: AtomicU64,
@@ -91,6 +135,8 @@ pub(crate) struct RawOrderBookMetrics {
     mbo_entries_with_order_ids: AtomicU64,
     mbo_entries_with_priority: AtomicU64,
     mbo_entries_with_previous_price: AtomicU64,
+    mbo_sequence_gaps: AtomicU64,
+    mbo_resnapshots: AtomicU64,
     mbo_selected_price_bits: AtomicU64,
 }
 
@@ -116,6 +162,8 @@ pub(crate) struct RawOrderBookMetricsSnapshot {
     pub(crate) mbo_entries_with_order_ids: u64,
     pub(crate) mbo_entries_with_priority: u64,
     pub(crate) mbo_entries_with_previous_price: u64,
+    pub(crate) mbo_sequence_gaps: u64,
+    pub(crate) mbo_resnapshots: u64,
     pub(crate) mbo_selected_price: Option<f64>,
 }
 
@@ -269,6 +317,8 @@ impl RawOrderBookMetrics {
             mbo_entries_with_previous_price: self
                 .mbo_entries_with_previous_price
                 .load(Ordering::Relaxed),
+            mbo_sequence_gaps: self.mbo_sequence_gaps.load(Ordering::Relaxed),
+            mbo_resnapshots: self.mbo_resnapshots.load(Ordering::Relaxed),
             mbo_selected_price: (selected_price_bits != 0)
                 .then(|| f64::from_bits(selected_price_bits)),
         }
@@ -1144,6 +1194,7 @@ impl RithmicSession {
     pub(crate) async fn run(
         mut self,
         subscriptions: Vec<MarketSubscription>,
+        runtime_commands: &mut tokio::sync::mpsc::UnboundedReceiver<RithmicSessionCommand>,
         data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
         clock: &'static AtomicTime,
         cancel: CancellationToken,
@@ -1164,10 +1215,36 @@ impl RithmicSession {
         let mut depth_by_order_requests =
             HashMap::<InstrumentId, (MarketSubscription, Option<f64>)>::new();
         let mut mbo_order_ids = HashMap::<u64, String>::new();
+        let mut active_runtime_subscriptions = HashSet::<RuntimeSubscription>::new();
+        let mut mbo_sync = HashMap::<InstrumentId, MboSyncState>::new();
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         websocket_ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await;
         websocket_ping.tick().await;
+
+        for subscription in &subscriptions {
+            let instrument_id = InstrumentId::from(
+                format!("{}.{}", subscription.symbol, subscription.exchange).as_str(),
+            );
+            if subscription.update_bits & crate::protocol::update_bits::BBO != 0 {
+                active_runtime_subscriptions.insert(RuntimeSubscription {
+                    instrument_id,
+                    data_type: RuntimeDataType::Quote,
+                });
+            }
+            if subscription.update_bits & crate::protocol::update_bits::LAST_TRADE != 0 {
+                active_runtime_subscriptions.insert(RuntimeSubscription {
+                    instrument_id,
+                    data_type: RuntimeDataType::Trade,
+                });
+            }
+            if subscription.update_bits & crate::protocol::update_bits::ORDER_BOOK != 0 {
+                active_runtime_subscriptions.insert(RuntimeSubscription {
+                    instrument_id,
+                    data_type: RuntimeDataType::Book(RithmicBookFeed::L2Mbp),
+                });
+            }
+        }
 
         if probe_depth_by_order {
             if let Some(depth_price) = depth_by_order_price {
@@ -1191,6 +1268,11 @@ impl RithmicSession {
                     instrument_id,
                     (subscription.clone(), depth_by_order_price),
                 );
+                mbo_sync.insert(instrument_id, MboSyncState::default());
+                active_runtime_subscriptions.insert(RuntimeSubscription {
+                    instrument_id,
+                    data_type: RuntimeDataType::Book(RithmicBookFeed::L3Mbo),
+                });
             }
         }
 
@@ -1220,6 +1302,17 @@ impl RithmicSession {
                         "Rithmic WebSocket pong timed out after {WEBSOCKET_PING_TIMEOUT:?}"
                     )
                 }
+                command = runtime_commands.recv() => {
+                    let Some(command) = command else {
+                        anyhow::bail!("Rithmic runtime subscription channel closed")
+                    };
+                    self.handle_runtime_command(
+                        command,
+                        &mut active_runtime_subscriptions,
+                        &mut depth_by_order_requests,
+                        &mut mbo_sync,
+                    ).await?;
+                }
                 message = self.socket.next() => {
                     let Some(message) = message else {
                         anyhow::bail!("Rithmic WebSocket stream ended")
@@ -1239,6 +1332,7 @@ impl RithmicSession {
                         depth_by_order_price,
                         &mut depth_by_order_requests,
                         &mut mbo_order_ids,
+                        &mut mbo_sync,
                         &mut heartbeat_watchdog,
                     ).await?;
                 }
@@ -1263,6 +1357,83 @@ impl RithmicSession {
         Ok(())
     }
 
+    async fn handle_runtime_command(
+        &mut self,
+        command: RithmicSessionCommand,
+        active: &mut HashSet<RuntimeSubscription>,
+        depth_by_order_requests: &mut HashMap<
+            InstrumentId,
+            (MarketSubscription, Option<f64>),
+        >,
+        mbo_sync: &mut HashMap<InstrumentId, MboSyncState>,
+    ) -> anyhow::Result<()> {
+        let (subscription, subscribe) = match command {
+            RithmicSessionCommand::Subscribe(subscription) => (subscription, true),
+            RithmicSessionCommand::Unsubscribe(subscription) => (subscription, false),
+        };
+        if subscribe && !active.insert(subscription.clone()) {
+            return Ok(());
+        }
+        if !subscribe && !active.remove(&subscription) {
+            return Ok(());
+        }
+
+        let symbol = subscription.instrument_id.symbol.to_string();
+        let exchange = subscription.instrument_id.venue.to_string();
+        match subscription.data_type {
+            RuntimeDataType::Quote | RuntimeDataType::Trade => {
+                let bit = match subscription.data_type {
+                    RuntimeDataType::Quote => crate::protocol::update_bits::BBO,
+                    RuntimeDataType::Trade => crate::protocol::update_bits::LAST_TRADE,
+                    RuntimeDataType::Book(_) => unreachable!(),
+                };
+                let request = MarketSubscription::new(symbol, exchange, bit)
+                    .request(if subscribe {
+                        SubscriptionRequest::Subscribe
+                    } else {
+                        SubscriptionRequest::Unsubscribe
+                    });
+                Self::send_protobuf(&mut self.socket, &request).await?;
+            }
+            RuntimeDataType::Book(RithmicBookFeed::L2Mbp) => {
+                let request = MarketSubscription::new(
+                    symbol,
+                    exchange,
+                    crate::protocol::update_bits::ORDER_BOOK,
+                )
+                .request(if subscribe {
+                    SubscriptionRequest::Subscribe
+                } else {
+                    SubscriptionRequest::Unsubscribe
+                });
+                Self::send_protobuf(&mut self.socket, &request).await?;
+            }
+            RuntimeDataType::Book(RithmicBookFeed::L3Mbo) => {
+                let market = MarketSubscription::new(symbol, exchange, 0);
+                if subscribe {
+                    self.request_depth_by_order(&market, None).await?;
+                    depth_by_order_requests
+                        .insert(subscription.instrument_id, (market, None));
+                    mbo_sync.insert(subscription.instrument_id, MboSyncState::default());
+                } else {
+                    self.unsubscribe_depth_by_order(&market, None).await?;
+                    depth_by_order_requests.remove(&subscription.instrument_id);
+                    mbo_sync.remove(&subscription.instrument_id);
+                }
+            }
+            RuntimeDataType::Book(RithmicBookFeed::None) => {
+                anyhow::bail!("Cannot subscribe to the disabled Rithmic book feed")
+            }
+        }
+        log::info!(
+            "Rithmic runtime {} {:?} for {}",
+            if subscribe { "subscribed" } else { "unsubscribed" },
+            subscription.data_type,
+            subscription.instrument_id,
+        );
+        Ok(())
+    }
+
     async fn handle_websocket_message(
         &mut self,
         message: WebSocketMessage,
@@ -1278,6 +1449,7 @@ impl RithmicSession {
             (MarketSubscription, Option<f64>),
         >,
         mbo_order_ids: &mut HashMap<u64, String>,
+        mbo_sync: &mut HashMap<InstrumentId, MboSyncState>,
         heartbeat_watchdog: &mut LivenessWatchdog,
     ) -> anyhow::Result<()> {
         match message {
@@ -1417,10 +1589,17 @@ impl RithmicSession {
                             }),
                         );
                     }
+                    let instrument_id = InstrumentId::from(
+                        format!("{}.{}", response.symbol, response.exchange).as_str(),
+                    );
                     Self::validate_mbo_order_ids(&response.exchange_order_id, mbo_order_ids)?;
                     match parse_depth_by_order_snapshot(&response, clock.get_time_ns()) {
                         Ok(deltas) => {
-                            Self::send_data(data_sender, Data::Deltas(Box::new(deltas)));
+                            if let Some(state) = mbo_sync.get_mut(&instrument_id) {
+                                state.snapshot_sequence =
+                                    state.snapshot_sequence.max(response.sequence_number);
+                                state.snapshot_deltas.extend(deltas.deltas);
+                            }
                         }
                         Err(e) if response.exchange_order_id.is_empty() => {
                             log::debug!("Ignoring empty Rithmic MBO snapshot response: {e}");
@@ -1461,18 +1640,87 @@ impl RithmicSession {
                     if let Some(metrics) = raw_book_metrics {
                         metrics.observe_mbo_update(&update);
                     }
+                    let instrument_id = InstrumentId::from(
+                        format!("{}.{}", update.symbol, update.exchange).as_str(),
+                    );
                     Self::validate_mbo_order_ids(&update.exchange_order_id, mbo_order_ids)?;
-                    match parse_depth_by_order_update(&update, clock.get_time_ns()) {
-                        Ok(deltas) => {
-                            Self::send_data(data_sender, Data::Deltas(Box::new(deltas)));
+                    let Some(state) = mbo_sync.get_mut(&instrument_id) else {
+                        log::debug!("Ignoring unsolicited Rithmic MBO update for {instrument_id}");
+                        return Ok(());
+                    };
+                    if state.phase == MboSyncPhase::AwaitingSnapshot {
+                        state.buffered_updates.push(update);
+                        return Ok(());
+                    }
+                    if state.last_sequence != 0
+                        && update.sequence_number > state.last_sequence.saturating_add(1)
+                    {
+                        state.gap_count = state.gap_count.saturating_add(1);
+                        state.resnapshot_count = state.resnapshot_count.saturating_add(1);
+                        if let Some(metrics) = raw_book_metrics {
+                            metrics.mbo_sequence_gaps.fetch_add(1, Ordering::Relaxed);
+                            metrics.mbo_resnapshots.fetch_add(1, Ordering::Relaxed);
                         }
+                        state.phase = MboSyncPhase::AwaitingSnapshot;
+                        state.snapshot_sequence = 0;
+                        state.snapshot_deltas.clear();
+                        state.buffered_updates.push(update);
+                        log::warn!(
+                            "Rithmic MBO sequence gap for {instrument_id}: expected {}, received {}; requesting resnapshot",
+                            state.last_sequence.saturating_add(1),
+                            state.buffered_updates.last().map_or(0, |value| value.sequence_number),
+                        );
+                        if let Some((subscription, depth_price)) =
+                            depth_by_order_requests.get(&instrument_id)
+                        {
+                            self.request_depth_by_order_snapshot(subscription, *depth_price)
+                                .await?;
+                        }
+                        return Ok(());
+                    }
+                    if update.sequence_number < state.last_sequence {
+                        log::debug!(
+                            "Ignoring stale Rithmic MBO sequence {} for {instrument_id}",
+                            update.sequence_number,
+                        );
+                        return Ok(());
+                    }
+                    match parse_depth_by_order_update(&update, clock.get_time_ns()) {
+                        Ok(deltas) => Self::send_data(
+                            data_sender,
+                            Data::Deltas(Box::new(deltas)),
+                        ),
                         Err(e) => log::warn!("Ignoring invalid Rithmic MBO update: {e}"),
                     }
+                    state.last_sequence = update.sequence_number;
                     Self::release_deleted_mbo_order_ids(&update, mbo_order_ids);
                 }
-                InboundMessage::DepthByOrderEnd(_) => {
+                InboundMessage::DepthByOrderEnd(end) => {
                     if let Some(metrics) = raw_book_metrics {
                         metrics.mbo_end_events.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let mut instruments = end
+                        .symbol
+                        .iter()
+                        .zip(&end.exchange)
+                        .map(|(symbol, exchange)| {
+                            InstrumentId::from(format!("{symbol}.{exchange}").as_str())
+                        })
+                        .collect::<Vec<_>>();
+                    if instruments.is_empty() {
+                        instruments.extend(mbo_sync.iter().filter_map(|(instrument_id, state)| {
+                            (state.phase == MboSyncPhase::AwaitingSnapshot)
+                                .then_some(*instrument_id)
+                        }));
+                    }
+                    for instrument_id in instruments {
+                        Self::complete_mbo_snapshot(
+                            instrument_id,
+                            end.sequence_number,
+                            mbo_sync,
+                            data_sender,
+                            clock,
+                        )?;
                     }
                 }
                 InboundMessage::Unsupported(template_id) => {
@@ -1498,15 +1746,6 @@ impl RithmicSession {
         subscription: &MarketSubscription,
         depth_price: Option<f64>,
     ) -> anyhow::Result<()> {
-        let snapshot = RequestDepthByOrderSnapshot {
-            template_id: DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID,
-            user_msg: vec!["mbo_probe".to_string()],
-            symbol: subscription.symbol.clone(),
-            exchange: subscription.exchange.clone(),
-            depth_price,
-            ..Default::default()
-        };
-        Self::send_protobuf(&mut self.socket, &snapshot).await?;
         let updates = RequestDepthByOrderUpdates {
             template_id: DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID,
             user_msg: vec!["mbo_probe".to_string()],
@@ -1517,6 +1756,8 @@ impl RithmicSession {
             ..Default::default()
         };
         Self::send_protobuf(&mut self.socket, &updates).await?;
+        self.request_depth_by_order_snapshot(subscription, depth_price)
+            .await?;
         match depth_price {
             Some(depth_price) => log::info!(
                 "Requested Rithmic depth by order for {}.{} at {depth_price}",
@@ -1529,6 +1770,84 @@ impl RithmicSession {
                 subscription.symbol
             ),
         }
+        Ok(())
+    }
+
+    async fn request_depth_by_order_snapshot(
+        &mut self,
+        subscription: &MarketSubscription,
+        depth_price: Option<f64>,
+    ) -> anyhow::Result<()> {
+        let snapshot = RequestDepthByOrderSnapshot {
+            template_id: DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID,
+            user_msg: vec!["mbo_snapshot".to_string()],
+            symbol: subscription.symbol.clone(),
+            exchange: subscription.exchange.clone(),
+            depth_price,
+            ..Default::default()
+        };
+        Self::send_protobuf(&mut self.socket, &snapshot).await
+    }
+
+    fn complete_mbo_snapshot(
+        instrument_id: InstrumentId,
+        end_sequence: u64,
+        states: &mut HashMap<InstrumentId, MboSyncState>,
+        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        clock: &AtomicTime,
+    ) -> anyhow::Result<()> {
+        let Some(state) = states.get_mut(&instrument_id) else {
+            return Ok(());
+        };
+        if state.phase != MboSyncPhase::AwaitingSnapshot {
+            return Ok(());
+        }
+
+        let ts_init = clock.get_time_ns();
+        let snapshot_sequence = state.snapshot_sequence.max(end_sequence);
+        let mut deltas = Vec::with_capacity(state.snapshot_deltas.len().saturating_add(1));
+        deltas.push(OrderBookDelta::clear(
+            instrument_id,
+            snapshot_sequence,
+            ts_init,
+            ts_init,
+        ));
+        deltas.append(&mut state.snapshot_deltas);
+        if let Some(last) = deltas.last_mut() {
+            last.flags |= nautilus_model::enums::RecordFlag::F_LAST as u8;
+        }
+        Self::send_data(
+            data_sender,
+            Data::Deltas(Box::new(OrderBookDeltas::new_checked(
+                instrument_id,
+                deltas,
+            )?)),
+        );
+
+        state.last_sequence = snapshot_sequence;
+        state.phase = MboSyncPhase::Live;
+        let buffered = std::mem::take(&mut state.buffered_updates);
+        for update in buffered {
+            if update.sequence_number < state.last_sequence {
+                continue;
+            }
+            let sequence = update.sequence_number;
+            match parse_depth_by_order_update(&update, clock.get_time_ns()) {
+                Ok(deltas) => {
+                    Self::send_data(data_sender, Data::Deltas(Box::new(deltas)));
+                    state.last_sequence = sequence;
+                }
+                Err(error) => {
+                    log::warn!("Ignoring invalid buffered Rithmic MBO update: {error}")
+                }
+            }
+        }
+        log::info!(
+            "Rithmic MBO synchronized for {instrument_id} at sequence {} (gaps={}, resnapshots={})",
+            state.last_sequence,
+            state.gap_count,
+            state.resnapshot_count,
+        );
         Ok(())
     }
 
@@ -1930,5 +2249,35 @@ mod tests {
         assert_eq!(snapshot.mbo_entries_with_order_ids, 3);
         assert_eq!(snapshot.mbo_entries_with_priority, 3);
         assert_eq!(snapshot.mbo_entries_with_previous_price, 1);
+    }
+
+    #[rstest]
+    fn completes_mbo_snapshot_with_clear_boundary() {
+        let instrument_id = InstrumentId::from("MESU6.CME");
+        let mut states = HashMap::from([(
+            instrument_id,
+            MboSyncState {
+                snapshot_sequence: 42,
+                ..Default::default()
+            },
+        )]);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        RithmicSession::complete_mbo_snapshot(
+            instrument_id,
+            42,
+            &mut states,
+            &sender,
+            nautilus_core::time::get_atomic_clock_realtime(),
+        )
+        .unwrap();
+
+        let DataEvent::Data(Data::Deltas(deltas)) = receiver.try_recv().unwrap() else {
+            panic!("Expected synchronized MBO deltas")
+        };
+        assert_eq!(deltas.deltas.len(), 1);
+        assert_eq!(deltas.deltas[0].action, nautilus_model::enums::BookAction::Clear);
+        assert_eq!(states[&instrument_id].phase, MboSyncPhase::Live);
+        assert_eq!(states[&instrument_id].last_sequence, 42);
     }
 }

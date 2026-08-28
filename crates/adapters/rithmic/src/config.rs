@@ -10,6 +10,33 @@ use std::fmt::{Debug, Formatter};
 
 use serde::{Deserialize, Serialize};
 
+/// Rithmic order-book feed carried by one data-client instance.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        frozen,
+        eq,
+        module = "nautilus_trader.adapters.rithmic",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.rithmic")
+)]
+pub enum RithmicBookFeed {
+    /// Do not request an order-book feed.
+    None,
+    /// Aggregated market-by-price levels from template 156.
+    #[default]
+    L2Mbp,
+    /// Full-depth market-by-order events from templates 115-118 and 160-161.
+    L3Mbo,
+}
+
 /// Configuration for the native Rithmic live data client.
 #[derive(Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
@@ -49,6 +76,12 @@ pub struct RithmicDataClientConfig {
     /// mix L2 market-by-price and L3 market-by-order deltas.
     #[builder(default)]
     pub subscribe_mbo: bool,
+    /// Explicit order-book feed selection for runtime and UI configuration.
+    ///
+    /// When set, this supersedes the legacy `subscribe_book_deltas` and `subscribe_mbo` flags.
+    pub book_feed: Option<RithmicBookFeed>,
+    /// Optional stable client identity shown in Nautilus commands, logs, and UI events.
+    pub client_id: Option<String>,
     /// Request best-bid/offer updates.
     #[builder(default = true)]
     pub subscribe_quotes: bool,
@@ -79,6 +112,8 @@ impl Debug for RithmicDataClientConfig {
             .field("rollover_days", &self.rollover_days)
             .field("subscribe_book_deltas", &self.subscribe_book_deltas)
             .field("subscribe_mbo", &self.subscribe_mbo)
+            .field("book_feed", &self.book_feed)
+            .field("client_id", &self.client_id)
             .field("subscribe_quotes", &self.subscribe_quotes)
             .field("subscribe_trades", &self.subscribe_trades)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
@@ -103,6 +138,22 @@ impl Default for RithmicDataClientConfig {
     }
 }
 
+impl RithmicDataClientConfig {
+    /// Returns the effective order-book feed, including legacy configuration compatibility.
+    #[must_use]
+    pub fn effective_book_feed(&self) -> RithmicBookFeed {
+        self.book_feed.unwrap_or_else(|| {
+            if self.subscribe_mbo {
+                RithmicBookFeed::L3Mbo
+            } else if self.subscribe_book_deltas {
+                RithmicBookFeed::L2Mbp
+            } else {
+                RithmicBookFeed::None
+            }
+        })
+    }
+}
+
 #[cfg(feature = "python")]
 nautilus_core::impl_pyo3_config_getters!(RithmicDataClientConfig {
     gateway_url: String,
@@ -113,6 +164,8 @@ nautilus_core::impl_pyo3_config_getters!(RithmicDataClientConfig {
     rollover_days: u16,
     subscribe_book_deltas: bool,
     subscribe_mbo: bool,
+    book_feed: Option<RithmicBookFeed>,
+    client_id: Option<String>,
     subscribe_quotes: bool,
     subscribe_trades: bool,
     connect_timeout_secs: u64,
@@ -135,6 +188,7 @@ mod tests {
         assert_eq!(config.rollover_days, 7);
         assert!(config.subscribe_book_deltas);
         assert!(!config.subscribe_mbo);
+        assert_eq!(config.effective_book_feed(), RithmicBookFeed::L2Mbp);
         assert!(config.subscribe_quotes);
         assert!(config.subscribe_trades);
         assert_eq!(config.connect_timeout_secs, 30);

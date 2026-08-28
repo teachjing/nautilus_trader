@@ -87,10 +87,31 @@ cargo test -p nautilus-rithmic \
   -- --ignored --nocapture
 ```
 
-MBO and MBP are deliberately separate feed modes. For an MBO client, configure
-`subscribe_book_deltas=false` and `subscribe_mbo=true`. The adapter rejects enabling both because
-L2 price-level deltas and L3 order-level deltas cannot safely populate the same Nautilus book.
-MBO requests omit `depth_price`; no BBO-derived price filter is applied.
+MBO and MBP are deliberately separate feed modes. New configurations should use the typed
+`book_feed` option (`L2_MBP`, `L3_MBO`, or `NONE`). The legacy `subscribe_book_deltas` and
+`subscribe_mbo` flags remain available for compatibility when `book_feed` is unset. L2 price-level
+deltas and L3 order-level deltas cannot populate the same Nautilus client book. MBO requests omit
+`depth_price`; no BBO-derived price filter is applied.
+
+The adapter implements Nautilus runtime quote, trade, and order-book subscribe/unsubscribe
+commands. These commands are idempotent, survive reconnects, and can be issued by a FastAPI/UI
+control plane after the node starts. Use distinct identities so logs and WebSocket events retain
+the feed source:
+
+```python
+from nautilus_trader.adapters.rithmic import RithmicBookFeed, RithmicDataClientConfig
+
+mbo = RithmicDataClientConfig(
+    client_id="RITHMIC_MBO",
+    market_subscriptions=[],
+    book_feed=RithmicBookFeed.L3_MBO,
+)
+```
+
+An MBO subscription starts updates before requesting its snapshot, buffers increments until the
+template 161 end marker, and publishes one clear-and-rebuild L3 batch. Exchange sequence gaps are
+logged and trigger an automatic resnapshot. The live probe reports `mbo_sequence_gaps` and
+`mbo_resnapshots` for monitoring.
 
 The stable discovery catalog is written to
 `target/rithmic-diagnostics/rithmic-discovery.json`. Query it with:

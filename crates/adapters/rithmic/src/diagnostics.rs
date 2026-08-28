@@ -264,6 +264,10 @@ pub struct RithmicConnectionProbeResult {
     pub mbo_entries_with_priority: u64,
     /// Depth-by-order entries carrying a previous price.
     pub mbo_entries_with_previous_price: u64,
+    /// Number of detected exchange-sequence discontinuities.
+    pub mbo_sequence_gaps: u64,
+    /// Number of automatic MBO snapshot recovery requests.
+    pub mbo_resnapshots: u64,
     /// Whether received data proves true market-by-order capability.
     pub mbo_capable: bool,
 }
@@ -338,9 +342,11 @@ pub async fn run_connection_probe(
         "At least one Rithmic live probe subscription is required"
     );
     let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
-    let mbo_probe_enabled = config.subscribe_mbo || env_flag("RITHMIC_TEST_MBO");
+    let mbo_probe_enabled = config.effective_book_feed() == crate::config::RithmicBookFeed::L3Mbo
+        || env_flag("RITHMIC_TEST_MBO");
     anyhow::ensure!(
-        !(mbo_probe_enabled && config.subscribe_book_deltas),
+        !(mbo_probe_enabled
+            && config.effective_book_feed() == crate::config::RithmicBookFeed::L2Mbp),
         "Rithmic L2 market-by-price and L3 market-by-order subscriptions are mutually exclusive"
     );
     let discover_markets = env_flag("RITHMIC_DISCOVER_MARKETS")
@@ -456,10 +462,12 @@ pub async fn run_connection_probe(
     let task_raw_book_metrics = std::sync::Arc::clone(&raw_book_metrics);
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
+    let (_runtime_sender, mut runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut session_task = tokio::spawn(async move {
         session
             .run(
                 resolved,
+                &mut runtime_receiver,
                 sender,
                 get_atomic_clock_realtime(),
                 task_cancel,
@@ -513,6 +521,8 @@ pub async fn run_connection_probe(
     result.mbo_entries_with_order_ids = raw.mbo_entries_with_order_ids;
     result.mbo_entries_with_priority = raw.mbo_entries_with_priority;
     result.mbo_entries_with_previous_price = raw.mbo_entries_with_previous_price;
+    result.mbo_sequence_gaps = raw.mbo_sequence_gaps;
+    result.mbo_resnapshots = raw.mbo_resnapshots;
     result.mbo_capable = result.mbo_entries_with_order_ids > 0
         && (result.mbo_snapshot_messages > 0 || result.mbo_update_messages > 0);
     if result.mbo_capable {
@@ -584,6 +594,8 @@ fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Re
             "mbo_entries_with_order_ids": result.mbo_entries_with_order_ids,
             "mbo_entries_with_priority": result.mbo_entries_with_priority,
             "mbo_entries_with_previous_price": result.mbo_entries_with_previous_price,
+            "mbo_sequence_gaps": result.mbo_sequence_gaps,
+            "mbo_resnapshots": result.mbo_resnapshots,
             "mbo_capable": result.mbo_capable,
     });
     let details = details
@@ -727,11 +739,12 @@ fn subscriptions(config: &RithmicDataClientConfig) -> anyhow::Result<Vec<MarketS
     if config.subscribe_quotes {
         bits |= update_bits::BBO;
     }
-    if config.subscribe_book_deltas {
+    if config.effective_book_feed() == crate::config::RithmicBookFeed::L2Mbp {
         bits |= update_bits::ORDER_BOOK;
     }
     anyhow::ensure!(
-        bits != 0 || config.subscribe_mbo,
+        bits != 0
+            || config.effective_book_feed() == crate::config::RithmicBookFeed::L3Mbo,
         "At least one Rithmic market-data type must be enabled"
     );
 

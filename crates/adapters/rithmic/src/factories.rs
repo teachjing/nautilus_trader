@@ -20,6 +20,10 @@ use crate::{config::RithmicDataClientConfig, data::RithmicDataClient};
 
 /// Stable adapter name used by the global factory registry.
 pub const RITHMIC: &str = "RITHMIC";
+/// Recommended client identity for an L2 market-by-price instance.
+pub const RITHMIC_MBP: &str = "RITHMIC_MBP";
+/// Recommended client identity for an L3 market-by-order instance.
+pub const RITHMIC_MBO: &str = "RITHMIC_MBO";
 
 impl ClientConfig for RithmicDataClientConfig {
     fn as_any(&self) -> &dyn Any {

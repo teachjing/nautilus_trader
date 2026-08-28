@@ -14,7 +14,7 @@ use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 use crate::{
-    config::RithmicDataClientConfig,
+    config::{RithmicBookFeed, RithmicDataClientConfig},
     factories::{RITHMIC, RithmicDataClientFactory},
 };
 
@@ -34,6 +34,8 @@ impl RithmicDataClientConfig {
         rollover_days = None,
         subscribe_book_deltas = None,
         subscribe_mbo = None,
+        book_feed = None,
+        client_id = None,
         subscribe_quotes = None,
         subscribe_trades = None,
         connect_timeout_secs = None,
@@ -52,6 +54,8 @@ impl RithmicDataClientConfig {
         rollover_days: Option<u16>,
         subscribe_book_deltas: Option<bool>,
         subscribe_mbo: Option<bool>,
+        book_feed: Option<RithmicBookFeed>,
+        client_id: Option<String>,
         subscribe_quotes: Option<bool>,
         subscribe_trades: Option<bool>,
         connect_timeout_secs: Option<u64>,
@@ -71,6 +75,8 @@ impl RithmicDataClientConfig {
             subscribe_book_deltas: subscribe_book_deltas
                 .unwrap_or(defaults.subscribe_book_deltas),
             subscribe_mbo: subscribe_mbo.unwrap_or(defaults.subscribe_mbo),
+            book_feed,
+            client_id,
             subscribe_quotes: subscribe_quotes.unwrap_or(defaults.subscribe_quotes),
             subscribe_trades: subscribe_trades.unwrap_or(defaults.subscribe_trades),
             connect_timeout_secs: connect_timeout_secs.unwrap_or(defaults.connect_timeout_secs),
@@ -126,6 +132,7 @@ fn extract_config(py: Python<'_>, config: Py<PyAny>) -> PyResult<Box<dyn ClientC
 /// Returns an error if a Python class or registry extractor cannot be registered.
 #[pymodule]
 pub fn rithmic(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<RithmicBookFeed>()?;
     m.add_class::<RithmicDataClientConfig>()?;
     m.add_class::<RithmicDataClientFactory>()?;
 
