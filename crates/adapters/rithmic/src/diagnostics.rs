@@ -38,7 +38,7 @@ use crate::{
 };
 
 /// Result of connecting idle, hydrating one contract, and toggling its live subscription.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RithmicDynamicSubscriptionProbeResult {
     pub instrument_id: InstrumentId,
     pub connected_idle: bool,
@@ -103,7 +103,9 @@ pub async fn run_dynamic_subscription_probe(
     let mut result = RithmicDynamicSubscriptionProbeResult {
         instrument_id,
         connected_idle: true,
-        ..Default::default()
+        instrument_hydrated: false,
+        market_data_events: 0,
+        unsubscribed_cleanly: false,
     };
     let hydration = tokio::time::sleep(hydration_timeout);
     tokio::pin!(hydration);
