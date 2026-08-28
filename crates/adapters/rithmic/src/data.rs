@@ -115,6 +115,14 @@ impl RithmicDataClient {
             "Rithmic L2 market-by-price and L3 market-by-order subscriptions are mutually exclusive"
         );
 
+        Ok(Self::build(client_id, config, get_data_event_sender()))
+    }
+
+    fn build(
+        client_id: ClientId,
+        config: RithmicDataClientConfig,
+        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    ) -> Self {
         let (history_sender, history_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (runtime_sender, runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
         let client_id = config
@@ -122,7 +130,7 @@ impl RithmicDataClient {
             .as_deref()
             .map(ClientId::from)
             .unwrap_or(client_id);
-        Ok(Self {
+        Self {
             client_id,
             venue: Venue::from("CME"),
             config,
@@ -135,9 +143,9 @@ impl RithmicDataClient {
             runtime_sender,
             runtime_receiver: Some(runtime_receiver),
             runtime_subscriptions: Arc::new(Mutex::new(HashSet::new())),
-            data_sender: get_data_event_sender(),
+            data_sender,
             clock: get_atomic_clock_realtime(),
-        })
+        }
     }
 
     fn credentials(&self) -> anyhow::Result<LoginCredentials> {
@@ -732,7 +740,9 @@ mod tests {
             client_id: Some("RITHMIC_MBO".to_string()),
             ..Default::default()
         };
-        let mut client = RithmicDataClient::new(ClientId::from("RITHMIC"), config).unwrap();
+        let (data_sender, _data_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut client =
+            RithmicDataClient::build(ClientId::from("RITHMIC"), config, data_sender);
         let command = SubscribeBookDeltas::new(
             nautilus_model::identifiers::InstrumentId::from("MESU6.CME"),
             BookType::L2_MBP,
@@ -759,7 +769,9 @@ mod tests {
             password: Some("password".to_string()),
             ..Default::default()
         };
-        let mut client = RithmicDataClient::new(ClientId::from("RITHMIC_MBP"), config).unwrap();
+        let (data_sender, _data_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut client =
+            RithmicDataClient::build(ClientId::from("RITHMIC_MBP"), config, data_sender);
         let instrument_id = nautilus_model::identifiers::InstrumentId::from("MESU6.CME");
 
         client
