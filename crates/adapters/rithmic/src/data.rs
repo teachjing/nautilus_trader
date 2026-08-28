@@ -184,8 +184,10 @@ impl RithmicDataClient {
             bits |= update_bits::ORDER_BOOK;
         }
         anyhow::ensure!(
-            bits != 0 || self.config.effective_book_feed() == RithmicBookFeed::L3Mbo,
-            "At least one Rithmic market-data type must be enabled"
+            self.config.market_subscriptions.is_empty()
+                || bits != 0
+                || self.config.effective_book_feed() == RithmicBookFeed::L3Mbo,
+            "At least one Rithmic market-data type must be enabled for configured instruments"
         );
 
         self.config
@@ -787,6 +789,24 @@ mod tests {
             Ok(RithmicSessionCommand::Subscribe(_))
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn permits_connect_first_configuration_without_seed_subscriptions() {
+        let config = RithmicDataClientConfig {
+            username: Some("user".to_string()),
+            password: Some("password".to_string()),
+            market_subscriptions: Vec::new(),
+            subscribe_quotes: false,
+            subscribe_trades: false,
+            subscribe_book_deltas: false,
+            book_feed: Some(RithmicBookFeed::None),
+            ..Default::default()
+        };
+        let (data_sender, _data_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let client = RithmicDataClient::build(ClientId::from("RITHMIC"), config, data_sender);
+
+        assert!(client.subscriptions().unwrap().is_empty());
     }
 
     #[rstest]
