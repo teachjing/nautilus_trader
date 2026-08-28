@@ -42,6 +42,7 @@ use crate::{
     config::{RithmicBookFeed, RithmicDataClientConfig},
     flow::{LoginCredentials, MarketSubscription},
     history::RithmicHistoricalBarType,
+    mbo::register_rithmic_custom_data,
     protocol::update_bits,
     session::{
         ReconnectBackoff, RithmicSession, RithmicSessionCommand, RuntimeDataType,
@@ -114,6 +115,11 @@ impl RithmicDataClient {
                 || !(config.subscribe_book_deltas && config.subscribe_mbo),
             "Rithmic L2 market-by-price and L3 market-by-order subscriptions are mutually exclusive"
         );
+        anyhow::ensure!(
+            !config.publish_mbo_events
+                || config.effective_book_feed() == RithmicBookFeed::L3Mbo,
+            "Rithmic custom MBO events require the L3 MBO book feed"
+        );
 
         Ok(Self::build(client_id, config, get_data_event_sender()))
     }
@@ -123,6 +129,7 @@ impl RithmicDataClient {
         config: RithmicDataClientConfig,
         data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     ) -> Self {
+        register_rithmic_custom_data();
         let (history_sender, history_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (runtime_sender, runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
         let client_id = config
@@ -421,6 +428,7 @@ impl DataClient for RithmicDataClient {
         let initial_delay = Duration::from_secs(self.config.reconnect_delay_initial_secs);
         let maximum_delay = Duration::from_secs(self.config.reconnect_delay_max_secs);
         let subscribe_mbo = self.config.effective_book_feed() == RithmicBookFeed::L3Mbo;
+        let publish_mbo_events = self.config.publish_mbo_events;
         let (session, resolved_subscriptions) = RithmicSession::connect_subscribed(
             &gateway_url,
             &credentials,
@@ -492,6 +500,7 @@ impl DataClient for RithmicDataClient {
                         None,
                         subscribe_mbo,
                         None,
+                        publish_mbo_events,
                     )
                     .await;
                 if session_started.elapsed() >= STABLE_SESSION_THRESHOLD {
