@@ -41,6 +41,7 @@ the current Rithmic adapter can populate and which Rithmic templates provide the
 | `QuoteTick` | Implemented | Template 151 BBO. Partial bid/ask updates are combined with cached state and normalized to equal precision. |
 | `OrderBookDelta` / `OrderBookDeltas` (`L2_MBP`) | Implemented | Template 156 full-depth market-by-price snapshots and incremental price-level updates. |
 | `OrderBookDelta` / `OrderBookDeltas` (`L3_MBO`) | Implemented | Templates 115-118 and 160/161 expose exchange order IDs, queue priority, new/change/delete events and previous price. The adapter omits the optional `depth_price` request field to receive all available orders. |
+| `RithmicMboEvent` (`CustomData`) | Opt-in | Losslessly preserves the raw string order ID, hashed native ID, priority, current/previous price, displayed size, provider timestamps, sequence and explicit snapshot boundary for a stateful actor. |
 | `OrderBookDepth10` | Derivable, not emitted | The first ten bid/ask levels can be projected from template 156, but the adapter currently emits deltas so Nautilus maintains the book. |
 | `Bar` | Implemented for historical time bars | History Plant templates 202/203 map OHLCV and marker time to an external Nautilus `Bar`. Second, minute, daily and weekly families are supported. |
 | Nautilus instrument definitions | Partial discovery only | Templates 109/110 produce a queryable symbol catalog. Full `FuturesContract` creation still needs reference data such as tick size, currency, multiplier and expiration semantics. |
@@ -84,6 +85,7 @@ export RITHMIC_DISCOVERY_TIMEOUT_SECS="300"
 
 export RITHMIC_TEST_MBO="true"
 export RITHMIC_REQUIRE_MBO="true"
+export RITHMIC_PUBLISH_MBO_EVENTS="true"
 
 # Optional: discover whether this account permits simultaneous plant sockets.
 export RITHMIC_TEST_PLANT_CAPACITY="true"
@@ -112,13 +114,20 @@ mbo = RithmicDataClientConfig(
     client_id="RITHMIC_MBO",
     market_subscriptions=[],
     book_feed=RithmicBookFeed.L3_MBO,
+    publish_mbo_events=True,
 )
 ```
 
 An MBO subscription starts updates before requesting its snapshot, buffers increments until the
-template 161 end marker, and publishes one clear-and-rebuild L3 batch. Exchange sequence gaps are
-logged and trigger an automatic resnapshot. The live probe reports `mbo_sequence_gaps` and
-`mbo_resnapshots` for monitoring.
+final multipart template 116 response (or compatible template 161 marker), and publishes one
+clear-and-rebuild L3 batch. Sparse forward venue-sequence movement is reported separately as
+`mbo_sequence_jumps`; it is not treated as confirmed packet loss without a provider continuity
+guarantee. The live probe also reports confirmed gaps and recovery snapshots separately.
+
+When `publish_mbo_events=True`, every snapshot order and template 160 lifecycle action is also
+published as instrument-addressable `CustomData` containing a `RithmicMboEvent`. A distinct
+`SNAPSHOT_COMPLETE` event closes the provider snapshot for deterministic actor state. This stream
+is opt-in because full-depth MBO can produce substantially more events than quotes, trades or L2.
 
 The stable discovery catalog is written to
 `target/rithmic-diagnostics/rithmic-discovery.json`. Query it with:
