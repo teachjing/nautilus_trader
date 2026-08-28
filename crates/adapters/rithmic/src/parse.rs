@@ -425,7 +425,10 @@ pub(crate) fn mbo_order_id(value: &str) -> anyhow::Result<u64> {
 fn instrument_id(symbol: &str, exchange: &str) -> anyhow::Result<InstrumentId> {
     anyhow::ensure!(!symbol.is_empty(), "Rithmic symbol is empty");
     anyhow::ensure!(!exchange.is_empty(), "Rithmic exchange is empty");
-    Ok(InstrumentId::new(Symbol::new(symbol), Venue::new(exchange)))
+    Ok(InstrumentId::new(
+        Symbol::new_checked(symbol)?,
+        Venue::new_checked(exchange)?,
+    ))
 }
 
 fn trade_id(update: &LastTrade, ts_event: UnixNanos) -> anyhow::Result<TradeId> {
