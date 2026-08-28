@@ -11,10 +11,53 @@
 use std::time::Duration;
 
 use nautilus_model::enums::BookType;
+use nautilus_model::identifiers::InstrumentId;
 use nautilus_rithmic::{
     config::RithmicDataClientConfig,
-    diagnostics::run_connection_probe,
+    diagnostics::{run_connection_probe, run_dynamic_subscription_probe},
 };
+
+#[tokio::test]
+#[ignore = "requires live Rithmic credentials and reference-data entitlement"]
+async fn connects_idle_then_hydrates_subscribes_and_unsubscribes() {
+    let system_name = std::env::var("RITHMIC_SYSTEM_NAME")
+        .unwrap_or_else(|_| "Rithmic Paper Trading".to_string());
+    let gateway_url = std::env::var("RITHMIC_GATEWAY_URL")
+        .unwrap_or_else(|_| "wss://rprotocol-mobile.rithmic.com/".to_string());
+    let instrument_id = std::env::var("RITHMIC_DYNAMIC_INSTRUMENT_ID")
+        .unwrap_or_else(|_| "MESU6.CME".to_string());
+    let instrument_id = InstrumentId::from_as_ref(&instrument_id)
+        .expect("RITHMIC_DYNAMIC_INSTRUMENT_ID must use SYMBOL.VENUE format");
+    let idle_secs = std::env::var("RITHMIC_DYNAMIC_IDLE_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2);
+    let hydration_timeout_secs = std::env::var("RITHMIC_DYNAMIC_HYDRATION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30);
+    let config = RithmicDataClientConfig {
+        system_name,
+        gateway_url,
+        market_subscriptions: Vec::new(),
+        diagnostic_log_dir: Some("target/rithmic-diagnostics".to_string()),
+        ..Default::default()
+    };
+
+    let result = run_dynamic_subscription_probe(
+        config,
+        instrument_id,
+        Duration::from_secs(idle_secs),
+        Duration::from_secs(hydration_timeout_secs),
+    )
+    .await
+    .expect("Rithmic dynamic subscription probe failed");
+    println!("Rithmic dynamic subscription result: {result:#?}");
+
+    assert!(result.connected_idle);
+    assert!(result.instrument_hydrated);
+    assert!(result.unsubscribed_cleanly);
+}
 
 #[tokio::test]
 #[ignore = "requires live Rithmic credentials, entitlements, and an active market"]

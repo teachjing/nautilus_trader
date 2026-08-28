@@ -106,6 +106,7 @@ pub(crate) struct RuntimeSubscription {
 pub(crate) enum RithmicSessionCommand {
     Subscribe(RuntimeSubscription),
     Unsubscribe(RuntimeSubscription),
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1394,9 +1395,14 @@ impl RithmicSession {
         clock: &AtomicTime,
         hydrated_instruments: &mut HashSet<InstrumentId>,
     ) -> anyhow::Result<()> {
+        if let RithmicSessionCommand::Barrier(acknowledgment) = command {
+            let _ = acknowledgment.send(());
+            return Ok(());
+        }
         let (subscription, subscribe) = match command {
             RithmicSessionCommand::Subscribe(subscription) => (subscription, true),
             RithmicSessionCommand::Unsubscribe(subscription) => (subscription, false),
+            RithmicSessionCommand::Barrier(_) => unreachable!(),
         };
         if subscribe && !active.insert(subscription.clone()) {
             return Ok(());
