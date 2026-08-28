@@ -79,6 +79,13 @@ use crate::transport::{
 
 type RithmicWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+fn checked_instrument_id(symbol: &str, exchange: &str) -> anyhow::Result<InstrumentId> {
+    anyhow::ensure!(!symbol.is_empty(), "Rithmic symbol is empty");
+    anyhow::ensure!(!exchange.is_empty(), "Rithmic exchange is empty");
+    InstrumentId::from_as_ref(format!("{symbol}.{exchange}"))
+        .map_err(|e| anyhow::anyhow!("Invalid Rithmic instrument '{symbol}.{exchange}': {e}"))
+}
+
 /// Runtime market-data stream controlled through Nautilus subscription commands.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RuntimeDataType {
@@ -1623,9 +1630,16 @@ impl RithmicSession {
                     }
                 }
                 InboundMessage::BestBidOffer(update) => {
-                    let instrument_id = InstrumentId::from(
-                        format!("{}.{}", update.symbol, update.exchange).as_str(),
-                    );
+                    let instrument_id = match checked_instrument_id(
+                        &update.symbol,
+                        &update.exchange,
+                    ) {
+                        Ok(instrument_id) => instrument_id,
+                        Err(e) => {
+                            log::warn!("Ignoring invalid Rithmic BBO update: {e}");
+                            return Ok(());
+                        }
+                    };
                     let state = quote_cache.entry(instrument_id).or_default();
                     match parse_quote(&update, state, clock.get_time_ns()) {
                         Ok(Some(quote)) => Self::send_data(data_sender, Data::Quote(quote)),
@@ -1707,9 +1721,20 @@ impl RithmicSession {
                             }),
                         );
                     }
-                    let instrument_id = InstrumentId::from(
-                        format!("{}.{}", response.symbol, response.exchange).as_str(),
-                    );
+                    let instrument_id = match checked_instrument_id(
+                        &response.symbol,
+                        &response.exchange,
+                    ) {
+                        Ok(instrument_id) => instrument_id,
+                        Err(e) if response.exchange_order_id.is_empty() => {
+                            log::debug!("Ignoring empty Rithmic MBO snapshot frame: {e}");
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            log::warn!("Ignoring invalid Rithmic MBO snapshot: {e}");
+                            return Ok(());
+                        }
+                    };
                     Self::validate_mbo_order_ids(&response.exchange_order_id, mbo_order_ids)?;
                     match parse_depth_by_order_snapshot(&response, clock.get_time_ns()) {
                         Ok(deltas) => {
@@ -1758,9 +1783,16 @@ impl RithmicSession {
                     if let Some(metrics) = raw_book_metrics {
                         metrics.observe_mbo_update(&update);
                     }
-                    let instrument_id = InstrumentId::from(
-                        format!("{}.{}", update.symbol, update.exchange).as_str(),
-                    );
+                    let instrument_id = match checked_instrument_id(
+                        &update.symbol,
+                        &update.exchange,
+                    ) {
+                        Ok(instrument_id) => instrument_id,
+                        Err(e) => {
+                            log::warn!("Ignoring invalid Rithmic MBO update: {e}");
+                            return Ok(());
+                        }
+                    };
                     Self::validate_mbo_order_ids(&update.exchange_order_id, mbo_order_ids)?;
                     let Some(state) = mbo_sync.get_mut(&instrument_id) else {
                         log::debug!("Ignoring unsolicited Rithmic MBO update for {instrument_id}");
@@ -1821,8 +1853,14 @@ impl RithmicSession {
                         .symbol
                         .iter()
                         .zip(&end.exchange)
-                        .map(|(symbol, exchange)| {
-                            InstrumentId::from(format!("{symbol}.{exchange}").as_str())
+                        .filter_map(|(symbol, exchange)| {
+                            match checked_instrument_id(symbol, exchange) {
+                                Ok(instrument_id) => Some(instrument_id),
+                                Err(e) => {
+                                    log::debug!("Ignoring empty Rithmic MBO end entry: {e}");
+                                    None
+                                }
+                            }
                         })
                         .collect::<Vec<_>>();
                     if instruments.is_empty() {
@@ -2205,6 +2243,13 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn rejects_empty_wire_instrument_without_panicking() {
+        let error = checked_instrument_id("", "").unwrap_err();
+
+        assert!(error.to_string().contains("symbol is empty"));
+    }
 
     #[rstest]
     fn reconnect_backoff_increases_linearly_and_caps() {
