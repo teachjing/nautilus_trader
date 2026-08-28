@@ -24,6 +24,7 @@ pub mod discovery;
 pub mod factories;
 pub mod flow;
 pub mod history;
+pub mod instruments;
 pub mod parse;
 pub mod protocol;
 
