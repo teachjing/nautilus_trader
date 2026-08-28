@@ -80,6 +80,11 @@ pub struct RithmicDataClientConfig {
     ///
     /// When set, this supersedes the legacy `subscribe_book_deltas` and `subscribe_mbo` flags.
     pub book_feed: Option<RithmicBookFeed>,
+    /// Publish lossless provider-specific MBO lifecycle events as Nautilus custom data.
+    ///
+    /// This is opt-in because it duplicates the high-volume L3 feed for actor analysis.
+    #[builder(default)]
+    pub publish_mbo_events: bool,
     /// Optional stable client identity shown in Nautilus commands, logs, and UI events.
     pub client_id: Option<String>,
     /// Request best-bid/offer updates.
@@ -113,6 +118,7 @@ impl Debug for RithmicDataClientConfig {
             .field("subscribe_book_deltas", &self.subscribe_book_deltas)
             .field("subscribe_mbo", &self.subscribe_mbo)
             .field("book_feed", &self.book_feed)
+            .field("publish_mbo_events", &self.publish_mbo_events)
             .field("client_id", &self.client_id)
             .field("subscribe_quotes", &self.subscribe_quotes)
             .field("subscribe_trades", &self.subscribe_trades)
@@ -165,6 +171,7 @@ nautilus_core::impl_pyo3_config_getters!(RithmicDataClientConfig {
     subscribe_book_deltas: bool,
     subscribe_mbo: bool,
     book_feed: Option<RithmicBookFeed>,
+    publish_mbo_events: bool,
     client_id: Option<String>,
     subscribe_quotes: bool,
     subscribe_trades: bool,
@@ -188,6 +195,7 @@ mod tests {
         assert_eq!(config.rollover_days, 7);
         assert!(config.subscribe_book_deltas);
         assert!(!config.subscribe_mbo);
+        assert!(!config.publish_mbo_events);
         assert_eq!(config.effective_book_feed(), RithmicBookFeed::L2Mbp);
         assert!(config.subscribe_quotes);
         assert!(config.subscribe_trades);
