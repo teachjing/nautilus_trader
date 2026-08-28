@@ -24,6 +24,13 @@ permits concurrent Ticker, Order, and History Plant connections.
 
 ## Nautilus data objects
 
+The ticker plant can connect with an empty `market_subscriptions` list and hydrate concrete
+contracts on demand. Before the first quote, trade, MBP, or MBO subscription, the adapter requests
+reference data, auxiliary reference data, and the applicable tick-size table, converts them to a
+native `FuturesContract`, and emits `DataEvent::Instrument`. Only then does it request the market
+data stream. Hydration is idempotent for a ticker-plant session and is repeated after reconnect
+before subscriptions are restored.
+
 Nautilus's built-in data model includes order-book deltas, depth snapshots, quotes, trades, bars,
 reference prices, status events, option Greeks, and custom data. The following table records what
 the current Rithmic adapter can populate and which Rithmic templates provide the source fields.
