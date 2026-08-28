@@ -33,6 +33,7 @@ use crate::{
         frozen,
         eq,
         module = "nautilus_trader.adapters.rithmic",
+        from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
 )]
