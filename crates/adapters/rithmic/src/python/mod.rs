@@ -16,7 +16,98 @@ use pyo3::prelude::*;
 use crate::{
     config::{RithmicBookFeed, RithmicDataClientConfig},
     factories::{RITHMIC, RithmicDataClientFactory},
+    flow::LoginCredentials,
+    session::RithmicSession,
 };
+
+fn discovery_credentials(config: &RithmicDataClientConfig) -> PyResult<LoginCredentials> {
+    let user = config
+        .username
+        .clone()
+        .or_else(|| std::env::var("RITHMIC_USER").ok())
+        .ok_or_else(|| to_pyruntime_err("Rithmic username missing"))?;
+    let password = config
+        .password
+        .clone()
+        .or_else(|| std::env::var("RITHMIC_PASSWORD").ok())
+        .ok_or_else(|| to_pyruntime_err("Rithmic password missing"))?;
+
+    Ok(LoginCredentials {
+        user,
+        password,
+        system_name: config.system_name.clone(),
+        app_name: "NautilusTrader".to_string(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        aggregated_quotes: false,
+    })
+}
+
+/// Discovers entitled exchanges and, optionally, their futures instruments.
+///
+/// The Python caller should invoke this blocking function through
+/// `asyncio.to_thread` so provider discovery never blocks the FastAPI event loop.
+#[pyfunction]
+#[pyo3(signature = (config, include_instruments = false, instrument_exchanges = None))]
+fn discover_catalog_json(
+    py: Python<'_>,
+    config: RithmicDataClientConfig,
+    include_instruments: bool,
+    instrument_exchanges: Option<Vec<String>>,
+) -> PyResult<String> {
+    let credentials = discovery_credentials(&config)?;
+    let exchanges = instrument_exchanges.unwrap_or_default();
+    py.allow_threads(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| to_pyruntime_err(format!("Failed to create Rithmic discovery runtime: {e}")))?;
+        let catalog = runtime
+            .block_on(RithmicSession::discover_catalog_sequential(
+                &config.gateway_url,
+                &credentials,
+                include_instruments,
+                &exchanges,
+                config.diagnostic_log_dir.as_deref(),
+            ))
+            .map_err(|e| to_pyruntime_err(format!("Rithmic catalog discovery failed: {e:#}")))?;
+        serde_json::to_string(&catalog)
+            .map_err(|e| to_pyruntime_err(format!("Failed to serialize Rithmic catalog: {e}")))
+    })
+}
+
+/// Searches futures instruments for one entitled exchange.
+///
+/// A full-instrument result can be converted directly to Nautilus identity as
+/// `SYMBOL.EXCHANGE`.
+#[pyfunction]
+fn search_instruments_json(
+    py: Python<'_>,
+    config: RithmicDataClientConfig,
+    exchange: String,
+    query: String,
+) -> PyResult<String> {
+    if exchange.trim().is_empty() || query.trim().is_empty() {
+        return Err(to_pyruntime_err("Rithmic exchange and query are required"));
+    }
+    let credentials = discovery_credentials(&config)?;
+    py.allow_threads(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| to_pyruntime_err(format!("Failed to create Rithmic discovery runtime: {e}")))?;
+        let instruments = runtime
+            .block_on(RithmicSession::search_instruments(
+                &config.gateway_url,
+                &credentials,
+                &exchange,
+                &query,
+                config.diagnostic_log_dir.as_deref(),
+            ))
+            .map_err(|e| to_pyruntime_err(format!("Rithmic instrument search failed: {e:#}")))?;
+        serde_json::to_string(&instruments)
+            .map_err(|e| to_pyruntime_err(format!("Failed to serialize Rithmic instruments: {e}")))
+    })
+}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -135,6 +226,8 @@ pub fn rithmic(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RithmicBookFeed>()?;
     m.add_class::<RithmicDataClientConfig>()?;
     m.add_class::<RithmicDataClientFactory>()?;
+    m.add_function(wrap_pyfunction!(discover_catalog_json, m)?)?;
+    m.add_function(wrap_pyfunction!(search_instruments_json, m)?)?;
 
     let registry = get_global_pyo3_registry();
     registry
