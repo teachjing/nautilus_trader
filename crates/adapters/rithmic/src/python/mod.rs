@@ -17,6 +17,7 @@ use crate::{
     config::{RithmicBookFeed, RithmicDataClientConfig},
     factories::{RITHMIC, RithmicDataClientFactory},
     flow::LoginCredentials,
+    mbo::{RithmicMboAction, RithmicMboEvent, register_rithmic_custom_data},
     session::RithmicSession,
 };
 
@@ -134,6 +135,7 @@ impl RithmicDataClientConfig {
         subscribe_book_deltas = None,
         subscribe_mbo = None,
         book_feed = None,
+        publish_mbo_events = None,
         client_id = None,
         subscribe_quotes = None,
         subscribe_trades = None,
@@ -154,6 +156,7 @@ impl RithmicDataClientConfig {
         subscribe_book_deltas: Option<bool>,
         subscribe_mbo: Option<bool>,
         book_feed: Option<RithmicBookFeed>,
+        publish_mbo_events: Option<bool>,
         client_id: Option<String>,
         subscribe_quotes: Option<bool>,
         subscribe_trades: Option<bool>,
@@ -175,6 +178,7 @@ impl RithmicDataClientConfig {
                 .unwrap_or(defaults.subscribe_book_deltas),
             subscribe_mbo: subscribe_mbo.unwrap_or(defaults.subscribe_mbo),
             book_feed,
+            publish_mbo_events: publish_mbo_events.unwrap_or(defaults.publish_mbo_events),
             client_id,
             subscribe_quotes: subscribe_quotes.unwrap_or(defaults.subscribe_quotes),
             subscribe_trades: subscribe_trades.unwrap_or(defaults.subscribe_trades),
@@ -231,7 +235,10 @@ fn extract_config(py: Python<'_>, config: Py<PyAny>) -> PyResult<Box<dyn ClientC
 /// Returns an error if a Python class or registry extractor cannot be registered.
 #[pymodule]
 pub fn rithmic(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_rithmic_custom_data();
     m.add_class::<RithmicBookFeed>()?;
+    m.add_class::<RithmicMboAction>()?;
+    m.add_class::<RithmicMboEvent>()?;
     m.add_class::<RithmicDataClientConfig>()?;
     m.add_class::<RithmicDataClientFactory>()?;
     m.add_function(wrap_pyfunction!(discover_catalog_json, m)?)?;
