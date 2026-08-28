@@ -94,8 +94,10 @@ pub fn parse_futures_contract(
         .single_point_value
         .filter(|value| value.is_finite() && *value > 0.0)
         .context("Rithmic single point value is missing")?;
-    let price_increment = Price::from_str(&tick.to_string())?;
-    let multiplier = Quantity::from_str(&multiplier.to_string())?;
+    let price_increment = Price::from_str(&tick.to_string())
+        .map_err(|e| anyhow::anyhow!("Invalid Rithmic price increment {tick}: {e}"))?;
+    let multiplier = Quantity::from_str(&multiplier.to_string())
+        .map_err(|e| anyhow::anyhow!("Invalid Rithmic contract multiplier {multiplier}: {e}"))?;
     let activation_ns = auxiliary
         .first_trading_date
         .as_deref()
@@ -183,4 +185,3 @@ mod tests {
         assert_eq!(instrument.multiplier(), Quantity::from(5));
     }
 }
-
