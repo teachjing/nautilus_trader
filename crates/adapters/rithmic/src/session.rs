@@ -1742,6 +1742,7 @@ impl RithmicSession {
                         }
                     };
                     Self::validate_mbo_order_ids(&response.exchange_order_id, mbo_order_ids)?;
+                    let snapshot_complete = response.rq_handler_rp_code.is_empty();
                     match parse_depth_by_order_snapshot(&response, clock.get_time_ns()) {
                         Ok(deltas) => {
                             if let Some(state) = mbo_sync.get_mut(&instrument_id) {
@@ -1749,9 +1750,31 @@ impl RithmicSession {
                                     state.snapshot_sequence.max(response.sequence_number);
                                 state.snapshot_deltas.extend(deltas.deltas);
                             }
+                            // Rithmic template 116 is a multipart response. The presence of
+                            // `rq_handler_rp_code` means more frames follow; an empty field marks
+                            // the final frame. Template 161 is retained as a secondary boundary,
+                            // but is not emitted by every Rithmic environment.
+                            if snapshot_complete {
+                                Self::complete_mbo_snapshot(
+                                    instrument_id,
+                                    response.sequence_number,
+                                    mbo_sync,
+                                    data_sender,
+                                    clock,
+                                )?;
+                            }
                         }
                         Err(e) if response.exchange_order_id.is_empty() => {
                             log::debug!("Ignoring empty Rithmic MBO snapshot response: {e}");
+                            if snapshot_complete {
+                                Self::complete_mbo_snapshot(
+                                    instrument_id,
+                                    response.sequence_number,
+                                    mbo_sync,
+                                    data_sender,
+                                    clock,
+                                )?;
+                            }
                         }
                         Err(e) => log::warn!("Ignoring invalid Rithmic MBO snapshot: {e}"),
                     }
@@ -1968,13 +1991,18 @@ impl RithmicSession {
         let ts_init = clock.get_time_ns();
         let snapshot_sequence = state.snapshot_sequence.max(end_sequence);
         let mut deltas = Vec::with_capacity(state.snapshot_deltas.len().saturating_add(1));
-        deltas.push(OrderBookDelta::clear(
+        let mut clear = OrderBookDelta::clear(
             instrument_id,
             snapshot_sequence,
             ts_init,
             ts_init,
-        ));
+        );
+        clear.flags = nautilus_model::enums::RecordFlag::F_SNAPSHOT as u8;
+        deltas.push(clear);
         deltas.append(&mut state.snapshot_deltas);
+        for delta in &mut deltas {
+            delta.flags = nautilus_model::enums::RecordFlag::F_SNAPSHOT as u8;
+        }
         if let Some(last) = deltas.last_mut() {
             last.flags |= nautilus_model::enums::RecordFlag::F_LAST as u8;
         }
@@ -2449,7 +2477,53 @@ mod tests {
         };
         assert_eq!(deltas.deltas.len(), 1);
         assert_eq!(deltas.deltas[0].action, nautilus_model::enums::BookAction::Clear);
+        assert!(
+            nautilus_model::enums::RecordFlag::F_SNAPSHOT.matches(deltas.deltas[0].flags)
+        );
+        assert!(nautilus_model::enums::RecordFlag::F_LAST.matches(deltas.deltas[0].flags));
         assert_eq!(states[&instrument_id].phase, MboSyncPhase::Live);
         assert_eq!(states[&instrument_id].last_sequence, 42);
+    }
+
+    #[rstest]
+    fn completes_multipart_mbo_snapshot_with_one_final_boundary() {
+        let instrument_id = InstrumentId::from("MESU6.CME");
+        let mut first = OrderBookDelta::clear(instrument_id, 41, 1.into(), 1.into());
+        first.flags = (nautilus_model::enums::RecordFlag::F_SNAPSHOT as u8)
+            | (nautilus_model::enums::RecordFlag::F_LAST as u8);
+        let mut second = first;
+        second.sequence = 42;
+        let mut states = HashMap::from([(
+            instrument_id,
+            MboSyncState {
+                snapshot_sequence: 42,
+                snapshot_deltas: vec![first, second],
+                ..Default::default()
+            },
+        )]);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        RithmicSession::complete_mbo_snapshot(
+            instrument_id,
+            42,
+            &mut states,
+            &sender,
+            nautilus_core::time::get_atomic_clock_realtime(),
+        )
+        .unwrap();
+
+        let DataEvent::Data(Data::Deltas(deltas)) = receiver.try_recv().unwrap() else {
+            panic!("Expected synchronized MBO deltas")
+        };
+        assert_eq!(deltas.deltas.len(), 3);
+        assert!(deltas.deltas.iter().all(|delta| {
+            nautilus_model::enums::RecordFlag::F_SNAPSHOT.matches(delta.flags)
+        }));
+        assert!(deltas.deltas[..2].iter().all(|delta| {
+            !nautilus_model::enums::RecordFlag::F_LAST.matches(delta.flags)
+        }));
+        assert!(
+            nautilus_model::enums::RecordFlag::F_LAST.matches(deltas.deltas[2].flags)
+        );
     }
 }

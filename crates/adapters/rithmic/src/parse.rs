@@ -314,7 +314,9 @@ pub fn parse_depth_by_order_snapshot(
         ));
     }
     anyhow::ensure!(!deltas.is_empty(), "Rithmic MBO snapshot contains no orders");
-    if !response.rp_code.is_empty() {
+    // Template 116 is multipart while the request-handler response code is present.
+    // Its absence marks the final frame in the snapshot response.
+    if response.rq_handler_rp_code.is_empty() {
         if let Some(last) = deltas.last_mut() {
             last.flags |= RecordFlag::F_LAST as u8;
         }
@@ -643,6 +645,25 @@ mod tests {
         assert_eq!(deltas.deltas[0].order.order_id, mbo_order_id("order-a").unwrap());
         assert!(RecordFlag::F_SNAPSHOT.matches(deltas.deltas[0].flags));
         assert!(RecordFlag::F_LAST.matches(deltas.flags));
+    }
+
+    #[rstest]
+    fn leaves_intermediate_mbo_snapshot_frame_open() {
+        let response = ResponseDepthByOrderSnapshot {
+            symbol: "ESU6".to_string(),
+            exchange: "CME".to_string(),
+            sequence_number: 42,
+            depth_side: DepthTransactionType::Buy as i32,
+            depth_price: Some(6_000.25),
+            depth_size: vec![3],
+            exchange_order_id: vec!["order-a".to_string()],
+            rq_handler_rp_code: vec!["0".to_string()],
+            ..Default::default()
+        };
+
+        let deltas = parse_depth_by_order_snapshot(&response, TS_INIT).unwrap();
+        assert!(RecordFlag::F_SNAPSHOT.matches(deltas.flags));
+        assert!(!RecordFlag::F_LAST.matches(deltas.flags));
     }
 
     #[rstest]
