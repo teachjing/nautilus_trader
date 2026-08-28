@@ -21,6 +21,7 @@ use nautilus_model::{
     data::{Data, OrderBookDelta},
     enums::{BookAction, BookType, OrderSide, RecordFlag},
     identifiers::InstrumentId,
+    instruments::Instrument,
     types::Price,
 };
 use tokio_util::sync::CancellationToken;
@@ -30,8 +31,120 @@ use crate::{
     discovery::{RithmicExchangeInfo, RithmicInstrumentInfo},
     flow::{LoginCredentials, MarketSubscription},
     protocol::update_bits,
-    session::{RawOrderBookMetrics, RithmicSession},
+    session::{
+        RawOrderBookMetrics, RithmicSession, RithmicSessionCommand, RuntimeDataType,
+        RuntimeSubscription,
+    },
 };
+
+/// Result of connecting idle, hydrating one contract, and toggling its live subscription.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RithmicDynamicSubscriptionProbeResult {
+    pub instrument_id: InstrumentId,
+    pub connected_idle: bool,
+    pub instrument_hydrated: bool,
+    pub market_data_events: u64,
+    pub unsubscribed_cleanly: bool,
+}
+
+/// Connects without instruments, then hydrates and subscribes to a contract supplied later.
+///
+/// # Errors
+///
+/// Returns an error for invalid configuration or instrument IDs, connection, hydration,
+/// subscription, timeout, or graceful-shutdown failures.
+pub async fn run_dynamic_subscription_probe(
+    config: RithmicDataClientConfig,
+    instrument_id: InstrumentId,
+    idle_duration: Duration,
+    hydration_timeout: Duration,
+) -> anyhow::Result<RithmicDynamicSubscriptionProbeResult> {
+    anyhow::ensure!(!hydration_timeout.is_zero(), "Hydration timeout must be positive");
+    let credentials = credentials(&config)?;
+    let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
+    let (session, resolved) = RithmicSession::connect_subscribed(
+        &config.gateway_url,
+        &credentials,
+        &[],
+        connect_timeout,
+        config.front_month_fallback.as_deref(),
+        config.diagnostic_log_dir.as_deref(),
+    )
+    .await?;
+    anyhow::ensure!(resolved.is_empty(), "Idle Rithmic connection resolved subscriptions");
+
+    let (data_sender, mut data_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (runtime_sender, mut runtime_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let mut session_task = tokio::spawn(async move {
+        session
+            .run(
+                Vec::new(),
+                &mut runtime_receiver,
+                data_sender,
+                get_atomic_clock_realtime(),
+                task_cancel,
+                None,
+                false,
+                None,
+            )
+            .await
+    });
+
+    tokio::time::sleep(idle_duration).await;
+    anyhow::ensure!(!session_task.is_finished(), "Rithmic idle session stopped unexpectedly");
+    let subscription = RuntimeSubscription {
+        instrument_id,
+        data_type: RuntimeDataType::Quote,
+    };
+    runtime_sender.send(RithmicSessionCommand::Subscribe(subscription.clone()))?;
+
+    let mut result = RithmicDynamicSubscriptionProbeResult {
+        instrument_id,
+        connected_idle: true,
+        ..Default::default()
+    };
+    let hydration = tokio::time::sleep(hydration_timeout);
+    tokio::pin!(hydration);
+    loop {
+        tokio::select! {
+            () = &mut hydration => {
+                anyhow::bail!("Timed out hydrating Rithmic instrument {instrument_id}")
+            }
+            event = data_receiver.recv() => {
+                let Some(event) = event else {
+                    anyhow::bail!("Rithmic dynamic probe event channel closed")
+                };
+                match event {
+                    DataEvent::Instrument(instrument) if instrument.id() == instrument_id => {
+                        result.instrument_hydrated = true;
+                        break;
+                    }
+                    DataEvent::Data(data) if data.instrument_id() == instrument_id => {
+                        result.market_data_events = result.market_data_events.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+            outcome = &mut session_task => {
+                outcome??;
+                anyhow::bail!("Rithmic dynamic probe stopped during hydration")
+            }
+        }
+    }
+
+    runtime_sender.send(RithmicSessionCommand::Unsubscribe(subscription))?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    anyhow::ensure!(
+        !session_task.is_finished(),
+        "Rithmic session stopped while unsubscribing {instrument_id}"
+    );
+    result.unsubscribed_cleanly = true;
+    cancel.cancel();
+    session_task.await??;
+    Ok(result)
+}
 
 /// Result of a focused Rithmic futures-contract search for one exchange.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
