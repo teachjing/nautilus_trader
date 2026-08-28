@@ -83,6 +83,9 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
         matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
     });
     let subscribe_mbo = require_mbo || test_mbo;
+    let publish_mbo_events = std::env::var("RITHMIC_PUBLISH_MBO_EVENTS").is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    });
     let config = RithmicDataClientConfig {
         system_name,
         gateway_url,
@@ -91,6 +94,7 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
         diagnostic_log_dir: Some(diagnostic_log_dir),
         subscribe_book_deltas: !subscribe_mbo,
         subscribe_mbo,
+        publish_mbo_events,
         ..Default::default()
     };
     let expected_system_name = config.system_name.clone();
@@ -119,6 +123,9 @@ async fn validates_live_ticker_plant_connection_and_native_events() {
         assert_eq!(result.order_book_type, Some(BookType::L3_MBO));
         assert!(result.mbo_subscription_accepted);
         assert!(result.mbo_capable);
+    }
+    if publish_mbo_events {
+        assert!(result.mbo_custom_events > 0);
     }
     if discover_markets || discover_instruments {
         assert!(result.discovery_catalog_path.is_some());
