@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::RithmicDataClientConfig,
     discovery::{RithmicExchangeInfo, RithmicInstrumentInfo},
+    mbo::RithmicMboEvent,
     flow::{LoginCredentials, MarketSubscription},
     protocol::update_bits,
     session::{
@@ -88,6 +89,7 @@ pub async fn run_dynamic_subscription_probe(
                 None,
                 false,
                 None,
+                false,
             )
             .await
     });
@@ -368,6 +370,8 @@ pub struct RithmicConnectionProbeResult {
     pub mbo_snapshot_messages: u64,
     /// Number of template 160 depth-by-order update messages.
     pub mbo_update_messages: u64,
+    /// Number of lossless `RithmicMboEvent` custom-data records published.
+    pub mbo_custom_events: u64,
     /// Number of template 161 depth-by-order end events.
     pub mbo_end_events: u64,
     /// Individual new orders observed in template 160 updates.
@@ -596,6 +600,7 @@ pub async fn run_connection_probe(
                 Some(task_raw_book_metrics),
                 mbo_probe_enabled,
                 None,
+                config.publish_mbo_events,
             )
             .await
     });
@@ -709,6 +714,7 @@ fn write_capability_summary(result: &RithmicConnectionProbeResult) -> anyhow::Re
             "mbo_subscription_rejected": result.mbo_subscription_rejected,
             "mbo_snapshot_messages": result.mbo_snapshot_messages,
             "mbo_update_messages": result.mbo_update_messages,
+            "mbo_custom_events": result.mbo_custom_events,
             "mbo_end_events": result.mbo_end_events,
             "mbo_new_orders": result.mbo_new_orders,
             "mbo_changed_orders": result.mbo_changed_orders,
@@ -778,6 +784,11 @@ fn count_event(
             result.order_book_batches += 1;
             result.order_book_deltas += 1;
             count_book_delta(result, state, delta);
+        }
+        DataEvent::Data(Data::Custom(custom))
+            if custom.data.as_any().is::<RithmicMboEvent>() =>
+        {
+            result.mbo_custom_events = result.mbo_custom_events.saturating_add(1);
         }
         _ => {}
     }
