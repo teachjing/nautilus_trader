@@ -45,17 +45,23 @@ use crate::{
         heartbeat_request,
     },
     history::{RithmicHistoricalBarType, parse_time_bar},
+    instruments::parse_futures_contract,
     parse::{
         QuoteState, mbo_order_id, parse_depth_by_order_snapshot, parse_depth_by_order_update,
         parse_order_book, parse_quote, parse_trade,
     },
     protocol::{
-        EntitlementFlag, FORCED_LOGOUT_TEMPLATE_ID, InboundMessage, InfrastructureType,
+        AUXILIARY_REFERENCE_DATA_REQUEST_TEMPLATE_ID,
+        AUXILIARY_REFERENCE_DATA_RESPONSE_TEMPLATE_ID, EntitlementFlag,
+        FORCED_LOGOUT_TEMPLATE_ID, InboundMessage, InfrastructureType,
         LOGOUT_REQUEST_TEMPLATE_ID,
         LOGIN_RESPONSE_TEMPLATE_ID, REJECT_TEMPLATE_ID, RequestLogout, RequestSystemInfo,
         RequestFrontMonthContract, ResponseCode, ResponseFrontMonthContract, ResponseSystemInfo,
         SYSTEM_INFO_REQUEST_TEMPLATE_ID, SYSTEM_INFO_RESPONSE_TEMPLATE_ID, SubscriptionRequest,
-        FRONT_MONTH_REQUEST_TEMPLATE_ID, FRONT_MONTH_RESPONSE_TEMPLATE_ID, decode_inbound,
+        FRONT_MONTH_REQUEST_TEMPLATE_ID, FRONT_MONTH_RESPONSE_TEMPLATE_ID,
+        REFERENCE_DATA_REQUEST_TEMPLATE_ID, REFERENCE_DATA_RESPONSE_TEMPLATE_ID,
+        RequestAuxiliaryReferenceData, RequestReferenceData, RequestTickSizeTable,
+        TICK_SIZE_TABLE_REQUEST_TEMPLATE_ID, TICK_SIZE_TABLE_RESPONSE_TEMPLATE_ID, decode_inbound,
         encode_frame, DepthByOrder, DepthUpdateType, RequestDepthByOrderSnapshot,
         RequestDepthByOrderUpdates, ResponseDepthByOrderSnapshot,
         DEPTH_BY_ORDER_SNAPSHOT_REQUEST_TEMPLATE_ID, DEPTH_BY_ORDER_UPDATES_REQUEST_TEMPLATE_ID,
@@ -632,9 +638,6 @@ impl RithmicSession {
                 let subscription = session
                     .resolve_subscription(subscription, front_month_fallback)
                     .await?;
-                if subscription.update_bits != 0 {
-                    session.subscribe(&subscription).await?;
-                }
                 resolved.push(subscription);
             }
             Ok((session, resolved))
@@ -1216,6 +1219,7 @@ impl RithmicSession {
             HashMap::<InstrumentId, (MarketSubscription, Option<f64>)>::new();
         let mut mbo_order_ids = HashMap::<u64, String>::new();
         let mut active_runtime_subscriptions = HashSet::<RuntimeSubscription>::new();
+        let mut hydrated_instruments = HashSet::<InstrumentId>::new();
         let mut mbo_sync = HashMap::<InstrumentId, MboSyncState>::new();
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         websocket_ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1226,6 +1230,16 @@ impl RithmicSession {
             let instrument_id = InstrumentId::from(
                 format!("{}.{}", subscription.symbol, subscription.exchange).as_str(),
             );
+            self.ensure_instrument(
+                subscription,
+                &data_sender,
+                clock,
+                &mut hydrated_instruments,
+            )
+            .await?;
+            if subscription.update_bits != 0 {
+                self.subscribe(subscription).await?;
+            }
             if subscription.update_bits & crate::protocol::update_bits::BBO != 0 {
                 active_runtime_subscriptions.insert(RuntimeSubscription {
                     instrument_id,
@@ -1311,6 +1325,9 @@ impl RithmicSession {
                         &mut active_runtime_subscriptions,
                         &mut depth_by_order_requests,
                         &mut mbo_sync,
+                        &data_sender,
+                        clock,
+                        &mut hydrated_instruments,
                     ).await?;
                 }
                 message = self.socket.next() => {
@@ -1366,6 +1383,9 @@ impl RithmicSession {
             (MarketSubscription, Option<f64>),
         >,
         mbo_sync: &mut HashMap<InstrumentId, MboSyncState>,
+        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        clock: &AtomicTime,
+        hydrated_instruments: &mut HashSet<InstrumentId>,
     ) -> anyhow::Result<()> {
         let (subscription, subscribe) = match command {
             RithmicSessionCommand::Subscribe(subscription) => (subscription, true),
@@ -1376,6 +1396,16 @@ impl RithmicSession {
         }
         if !subscribe && !active.remove(&subscription) {
             return Ok(());
+        }
+
+        if subscribe {
+            let market = MarketSubscription::new(
+                subscription.instrument_id.symbol.to_string(),
+                subscription.instrument_id.venue.to_string(),
+                0,
+            );
+            self.ensure_instrument(&market, data_sender, clock, hydrated_instruments)
+                .await?;
         }
 
         let symbol = subscription.instrument_id.symbol.to_string();
@@ -1431,6 +1461,94 @@ impl RithmicSession {
             subscription.data_type,
             subscription.instrument_id,
         );
+        Ok(())
+    }
+
+    async fn ensure_instrument(
+        &mut self,
+        subscription: &MarketSubscription,
+        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        clock: &AtomicTime,
+        hydrated: &mut HashSet<InstrumentId>,
+    ) -> anyhow::Result<()> {
+        let instrument_id = InstrumentId::from(
+            format!("{}.{}", subscription.symbol, subscription.exchange).as_str(),
+        );
+        if hydrated.contains(&instrument_id) {
+            return Ok(());
+        }
+
+        let request = RequestReferenceData {
+            template_id: REFERENCE_DATA_REQUEST_TEMPLATE_ID,
+            user_msg: vec![format!("instrument:{instrument_id}")],
+            symbol: Some(subscription.symbol.clone()),
+            exchange: Some(subscription.exchange.clone()),
+        };
+        Self::send_protobuf(&mut self.socket, &request).await?;
+        let InboundMessage::ReferenceData(reference) = Self::receive_expected(
+            &mut self.socket,
+            REFERENCE_DATA_RESPONSE_TEMPLATE_ID,
+        )
+        .await?
+        else {
+            anyhow::bail!("Rithmic reference-data request returned an unexpected response")
+        };
+        Self::ensure_codes_succeed(reference.template_id, &reference.rp_code)?;
+
+        let request = RequestAuxiliaryReferenceData {
+            template_id: AUXILIARY_REFERENCE_DATA_REQUEST_TEMPLATE_ID,
+            user_msg: vec![format!("instrument:{instrument_id}")],
+            symbol: Some(subscription.symbol.clone()),
+            exchange: Some(subscription.exchange.clone()),
+        };
+        Self::send_protobuf(&mut self.socket, &request).await?;
+        let InboundMessage::AuxiliaryReferenceData(auxiliary) = Self::receive_expected(
+            &mut self.socket,
+            AUXILIARY_REFERENCE_DATA_RESPONSE_TEMPLATE_ID,
+        )
+        .await?
+        else {
+            anyhow::bail!(
+                "Rithmic auxiliary reference-data request returned an unexpected response"
+            )
+        };
+        Self::ensure_codes_succeed(auxiliary.template_id, &auxiliary.rp_code)?;
+
+        let mut tick_table = Vec::new();
+        if let Some(tick_size_type) = reference.tick_size_type.as_deref() {
+            let request = RequestTickSizeTable {
+                template_id: TICK_SIZE_TABLE_REQUEST_TEMPLATE_ID,
+                user_msg: vec![format!("instrument:{instrument_id}")],
+                tick_size_type: Some(tick_size_type.to_string()),
+            };
+            Self::send_protobuf(&mut self.socket, &request).await?;
+            loop {
+                let InboundMessage::TickSizeTable(row) = Self::receive_expected(
+                    &mut self.socket,
+                    TICK_SIZE_TABLE_RESPONSE_TEMPLATE_ID,
+                )
+                .await?
+                else {
+                    anyhow::bail!("Rithmic tick-size request returned an unexpected response")
+                };
+                let complete = row.rq_handler_rp_code.is_empty();
+                if complete {
+                    Self::ensure_codes_succeed(row.template_id, &row.rp_code)?;
+                }
+                tick_table.push(row);
+                if complete {
+                    break;
+                }
+            }
+        }
+
+        let instrument =
+            parse_futures_contract(&reference, &auxiliary, &tick_table, clock.get_time_ns())?;
+        data_sender
+            .send(DataEvent::Instrument(instrument))
+            .map_err(|_| anyhow::anyhow!("Nautilus data event channel is unavailable"))?;
+        hydrated.insert(instrument_id);
+        log::info!("Hydrated Rithmic instrument {instrument_id}");
         Ok(())
     }
 
@@ -1941,6 +2059,9 @@ impl RithmicSession {
 
     fn template_id(message: &InboundMessage) -> Option<i32> {
         match message {
+            InboundMessage::ReferenceData(response) => Some(response.template_id),
+            InboundMessage::AuxiliaryReferenceData(response) => Some(response.template_id),
+            InboundMessage::TickSizeTable(response) => Some(response.template_id),
             InboundMessage::Login(response) => Some(response.template_id),
             InboundMessage::SystemInfo(response) => Some(response.template_id),
             InboundMessage::Logout(response)
