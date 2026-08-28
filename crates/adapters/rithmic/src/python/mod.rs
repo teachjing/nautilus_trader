@@ -60,7 +60,11 @@ fn discover_catalog_json(
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| to_pyruntime_err(format!("Failed to create Rithmic discovery runtime: {e}")))?;
+            .map_err(|e| {
+                to_pyruntime_err(format!(
+                    "Failed to create Rithmic discovery runtime: {e}"
+                ))
+            })?;
         let catalog = runtime
             .block_on(RithmicSession::discover_catalog_sequential(
                 &config.gateway_url,
@@ -94,7 +98,11 @@ fn search_instruments_json(
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| to_pyruntime_err(format!("Failed to create Rithmic discovery runtime: {e}")))?;
+            .map_err(|e| {
+                to_pyruntime_err(format!(
+                    "Failed to create Rithmic discovery runtime: {e}"
+                ))
+            })?;
         let instruments = runtime
             .block_on(RithmicSession::search_instruments(
                 &config.gateway_url,
